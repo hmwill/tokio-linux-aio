@@ -1,3 +1,4 @@
+use std::os::unix::io::RawFd;
 use libc::{c_uint, c_int, c_long};
 use aio_bindings::{aio_context_t, iocb, io_event, syscall, __NR_io_setup, __NR_io_destroy, __NR_io_submit, __NR_io_getevents, 
     IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IOCB_FLAG_RESFD, timespec};
@@ -21,4 +22,30 @@ unsafe fn io_submit(ctx: aio_context_t, nr: c_long, iocbpp: *mut *mut iocb) -> c
 unsafe fn io_getevents(ctx: aio_context_t, min_nr: c_long, max_nr: c_long, events: *mut io_event, 
     timeout: *mut timespec) -> c_long {
     syscall(__NR_io_getevents as c_long, ctx, min_nr, max_nr, events, timeout)
+}
+
+
+// EventFd Implementation
+
+struct EventFd {
+    fd: RawFd,
+}
+
+impl EventFd {
+
+}
+
+// AioContext Implementation
+
+struct AioContext {
+    // event fd to signal that we can accept more I/O requests
+    can_submit: EventFd,
+
+    // event fd indicating that I/O requests have been completed
+    completed: EventFd,
+
+}
+
+impl AioContext {
+    
 }
