@@ -11,7 +11,7 @@ tokio = "0.1"
 tokio-io = "0.1"
 futures = "0.1"
 mio = "0.6.13"
-aio-bindings = { path = "aio-bindings" }
+aio-bindings = { path = "aio-bindings", version = "0.1" }
 libc = "0.2"
 
 [workspace]
