@@ -1,0 +1,9 @@
+[package]
+name = "aio-bindings"
+version = "0.1.0"
+authors = ["Hans-Martin Will <hwill@acm.org>"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.32.3"
