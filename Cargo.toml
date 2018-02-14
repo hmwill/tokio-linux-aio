@@ -2,5 +2,7 @@
 name = "tokio-linux-aio"
 version = "0.1.0"
 authors = ["Hans-Martin Will <hwill@acm.org>"]
+description = "Tokio bindings for Linux kernel AIO"
+license = "MIT"
 
 [dependencies]
