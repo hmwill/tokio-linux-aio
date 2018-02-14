@@ -2,6 +2,9 @@
 name = "aio-bindings"
 version = "0.1.0"
 authors = ["Hans-Martin Will <hwill@acm.org>"]
+description = "Native kernel call bindings for Linux AIO"
+repository="https://github.com/hmwill/tokio-linux-aio/aio-bindings"
+license = "MIT"
 
 [dependencies]
 
