@@ -386,7 +386,7 @@ impl AioContext {
     }
 
     pub fn submit_read<'a, ReadWriteHandle>(
-        &'a mut self,
+        &'a self,
         fd: RawFd,
         offset: u64,
         buffer: ReadWriteHandle,
@@ -407,7 +407,7 @@ impl AioContext {
     }
 
     pub fn submit_write<'a, ReadOnlyHandle>(
-        &'a mut self,
+        &'a self,
         fd: RawFd,
         offset: u64,
         buffer: ReadOnlyHandle,
