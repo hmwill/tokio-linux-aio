@@ -141,21 +141,20 @@ impl EventFd {
     }
 }
 
-pub struct AioReadResultFuture<'a, ReadWriteHandle> where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
+trait IocbSetup {
+    fn setup(self) -> Self;
+}
+
+struct AioBaseFuture<'a> {
     context: &'a AioContext,
-    buffer: ReadWriteHandle,
     request: iocb,
     submitted: bool,
 
     result: cell::RefCell<Option<Result<(), io::Error>>>,
 }
 
-impl <'a, ReadWriteHandle> futures::Future for AioReadResultFuture<'a, ReadWriteHandle> 
-    where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
-    type Item = ();
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+impl <'a> AioBaseFuture<'a> {
+    fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
         if let Some(result) = self.result.borrow_mut().take() {
             // procesing has completed
             return result.map(|_| futures::Async::Ready(()));
@@ -168,11 +167,6 @@ impl <'a, ReadWriteHandle> futures::Future for AioReadResultFuture<'a, ReadWrite
                 Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
                 Ok(futures::Async::Ready(_)) => (),
             }
-
-            // Have space in the submission queue, now submit the I/O request
-            self.request.aio_data = unsafe { mem::transmute(self as *mut Self) };
-            self.request.aio_buf = unsafe { mem::transmute(self.buffer.deref_mut().as_ptr()) };
-            self.request.aio_nbytes = self.buffer.deref_mut().len() as u64; 
 
             // submit the request
             let mut request_ptr_array: [*mut iocb;1] = [&mut self.request as *mut iocb; 1];
@@ -212,8 +206,7 @@ impl <'a, ReadWriteHandle> futures::Future for AioReadResultFuture<'a, ReadWrite
             };
 
             for ref event in events.iter() {
-                // TODO: need to refactor this to have a common element across memory handle types
-                let future: &Self = unsafe { mem::transmute(event.data) };
+                let future: &AioBaseFuture = unsafe { mem::transmute(event.data) };
                 let result = event.res;
 
                 *future.result.borrow_mut() = 
@@ -240,14 +233,44 @@ impl <'a, ReadWriteHandle> futures::Future for AioReadResultFuture<'a, ReadWrite
     }
 }
 
-pub struct AioWriteResultFuture<'a, ReadOnlyHandle> where ReadOnlyHandle: ops::Deref<Target = [u8]> {
-    context: &'a AioContext,
-    buffer: ReadOnlyHandle,
-    request: iocb,
-    submitted: bool,
+pub struct AioReadResultFuture<'a, ReadWriteHandle> where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
+    base: AioBaseFuture<'a>,
+    buffer: ReadWriteHandle,
+}
 
-    // this will get filled in when the result or error code becomes available
-    result: cell::RefCell<Option<Result<(), io::Error>>>,
+impl <'a, ReadWriteHandle> IocbSetup for AioReadResultFuture<'a, ReadWriteHandle> 
+    where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
+    fn setup(mut self) -> Self {
+        self.base.request.aio_data = unsafe { mem::transmute(&mut self.base as *mut AioBaseFuture) };
+        self.base.request.aio_buf = unsafe { mem::transmute(self.buffer.deref_mut().as_ptr()) };
+        self.base.request.aio_nbytes = self.buffer.deref_mut().len() as u64;
+        self
+    }
+}
+
+impl <'a, ReadWriteHandle> futures::Future for AioReadResultFuture<'a, ReadWriteHandle> 
+    where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+        self.base.poll()
+    }
+}
+
+pub struct AioWriteResultFuture<'a, ReadOnlyHandle> where ReadOnlyHandle: ops::Deref<Target = [u8]> {
+    base: AioBaseFuture<'a>,
+    buffer: ReadOnlyHandle,
+}
+
+impl <'a, ReadOnlyHandle> IocbSetup for AioWriteResultFuture<'a, ReadOnlyHandle> 
+    where ReadOnlyHandle: ops::Deref<Target = [u8]> {
+    fn setup(mut self) -> Self {
+        self.base.request.aio_data = unsafe { mem::transmute(&mut self.base as *mut AioBaseFuture) };
+        self.base.request.aio_buf = unsafe { mem::transmute(self.buffer.deref().as_ptr()) };
+        self.base.request.aio_nbytes = self.buffer.deref().len() as u64;
+        self
+    }
 }
 
 impl <'a, ReadOnlyHandle> futures::Future for AioWriteResultFuture<'a, ReadOnlyHandle> 
@@ -256,13 +279,13 @@ impl <'a, ReadOnlyHandle> futures::Future for AioWriteResultFuture<'a, ReadOnlyH
     type Error = io::Error;
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
-        unimplemented!()
+        self.base.poll()
     }
 }
 
 // AioContext Implementation
 
-struct AioContext {
+pub struct AioContext {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
 
@@ -282,39 +305,43 @@ impl AioContext {
     /// # Params
     /// - handle: Reference to the event loop that is responsible fro driving this context
     /// - nr: Number of submission slots fro IO requests
-    pub fn new(handle: &reactor::Handle, nr: usize) -> AioContext {
+    pub fn new(handle: &reactor::Handle, nr: usize) -> Result<AioContext, io::Error> {
         let mut context: aio_context_t = 0;
 
         unsafe {
             if io_setup(nr as c_long, &mut context) != 0 {
-                panic!("System error creating aio_context_t");
+                return Err(io::Error::last_os_error());
             }
         };
 
-        // TODO: Convert unwrap below to proper error handling using a Result type
-
-        AioContext {
+        Ok(AioContext {
             context,
-            capacity: cell::RefCell::new(EventFd::create(handle, nr, true).unwrap()),
-            completed: cell::RefCell::new(EventFd::create(handle, 0, false).unwrap()),
+            capacity: cell::RefCell::new(EventFd::create(handle, nr, true)?),
+            completed: cell::RefCell::new(EventFd::create(handle, 0, false)?),
             completion_events: cell::RefCell::new(Vec::new()),
-        }
+        })
     }
 
     pub fn submit_read<'a, ReadWriteHandle>(&'a mut self, fd: RawFd, offset: u64, buffer: ReadWriteHandle) ->
         AioReadResultFuture<'a, ReadWriteHandle> where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
         // nothing really happens here until someone calls poll
-        AioReadResultFuture { context: self, buffer, 
-            request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset), 
-            submitted: false, result: cell::RefCell::new(None) }
+        AioReadResultFuture { 
+            base: AioBaseFuture { context: self, 
+            request: self.init_iocb(IOCB_CMD_PREAD, fd, offset), 
+            submitted: false, result: cell::RefCell::new(None) },
+            buffer, 
+        }.setup()
     }
 
     pub fn submit_write<'a, ReadOnlyHandle>(&'a mut self, fd: RawFd, offset: u64, buffer: ReadOnlyHandle) ->
         AioWriteResultFuture<'a, ReadOnlyHandle> where ReadOnlyHandle: ops::Deref<Target = [u8]> {
         // nothing really happens here until someone calls poll
-        AioWriteResultFuture { context: self, buffer, 
-            request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset), 
-            submitted: false, result: cell::RefCell::new(None) }
+        AioWriteResultFuture { 
+            base: AioBaseFuture { context: self, 
+            request: self.init_iocb(IOCB_CMD_PREAD, fd, offset), 
+            submitted: false, result: cell::RefCell::new(None) },
+            buffer, 
+        }.setup()
     }
 
     fn init_iocb(&self, opcode: u32, fd: RawFd, offset: u64) -> iocb {
