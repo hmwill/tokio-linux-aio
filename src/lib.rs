@@ -5,4 +5,3 @@ extern crate mio;
 extern crate tokio;
 
 pub mod linux;
-
