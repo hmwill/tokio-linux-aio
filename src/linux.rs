@@ -1,7 +1,19 @@
 use std::os::unix::io::RawFd;
-use libc::{c_uint, c_int, c_long};
+use std::cell;
+use std::collections;
+use std::error;
+use std::fmt;
+use std::io;
+use std::mem;
+use std::ops;
+use std::ptr;
+
+use libc::{c_uint, c_int, c_long, c_void, close, eventfd, O_CLOEXEC, EAGAIN, read, write};
+use futures;
+use mio;
 use aio_bindings::{aio_context_t, iocb, io_event, syscall, __NR_io_setup, __NR_io_destroy, __NR_io_submit, __NR_io_getevents, 
-    IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IOCB_FLAG_RESFD, timespec};
+    IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IOCB_FLAG_RESFD, timespec, EFD_NONBLOCK, EFD_SEMAPHORE};
+use tokio::reactor;
 
 #[inline(always)]
 unsafe fn io_setup(nr: c_long, ctxp: *mut aio_context_t) -> c_long {
@@ -24,28 +36,296 @@ unsafe fn io_getevents(ctx: aio_context_t, min_nr: c_long, max_nr: c_long, event
     syscall(__NR_io_getevents as c_long, ctx, min_nr, max_nr, events, timeout)
 }
 
-
 // EventFd Implementation
 
-struct EventFd {
+struct EventFdInner {
     fd: RawFd,
 }
 
-impl EventFd {
+impl Drop for EventFdInner {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+        }
+    }
+}
 
+impl mio::Evented for EventFdInner {
+    fn register(&self, poll: &mio::Poll, token: mio::Token,
+                interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
+        mio::unix::EventedFd(&self.fd).register(poll, token, interest, opts)
+    }
+
+    fn reregister(&self, poll: &mio::Poll, token: mio::Token,
+                  interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
+        mio::unix::EventedFd(&self.fd).reregister(poll, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
+        mio::unix::EventedFd(&self.fd).deregister(poll)
+    }
+}
+
+struct EventFd {
+    evented: reactor::PollEvented<EventFdInner>
+}
+
+impl EventFd {
+    fn create(handle: &reactor::Handle, init: usize, semaphore: bool) -> Result<EventFd, io::Error> {
+        let flags = if semaphore {
+            O_CLOEXEC | EFD_NONBLOCK as i32 | EFD_SEMAPHORE as i32
+        } else {
+            O_CLOEXEC | EFD_NONBLOCK as i32
+        };
+
+        let fd = unsafe { eventfd(init as c_uint, flags) };
+
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            reactor::PollEvented::new(EventFdInner { fd }, handle).map(|evented| EventFd { evented })
+        }
+    }
+
+    fn read(&mut self) -> Result<futures::Async<u64>, io::Error> {
+        match self.evented.poll_read() {
+            futures::Async::NotReady => return Ok(futures::Async::NotReady),
+            _ => (),
+        };
+
+        let fd = { self.evented.get_ref().fd };
+        let mut result: u64 = 0;
+
+        let result = unsafe {
+            read(fd, mem::transmute(&mut result as *mut u64), mem::size_of_val(&result))
+        };
+
+        if result < 0 {
+            let error = io::Error::last_os_error();
+
+            if error.raw_os_error().unwrap() != EAGAIN {
+                // this is a regular eeror
+                return Err(io::Error::last_os_error());
+            } else {
+                if let Err(err) = self.evented.need_read() {
+                    return Err(err);
+                } else {
+                    return Ok(futures::Async::NotReady);
+                }
+            }
+        } else {
+            if result as usize != mem::size_of_val(&result) {
+                panic!("Writing to an eventfd should consume exactly 8 bytes")
+            }
+
+            Ok(futures::Async::Ready(result as u64))
+        }
+    }
+
+    fn add(&mut self, increment: u64) -> Result<(), io::Error> {
+        let fd = { self.evented.get_ref().fd };
+
+        let result = unsafe {
+            write(fd, mem::transmute(&increment as *const u64), mem::size_of_val(&increment))
+        };
+
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            if result as usize != mem::size_of_val(&increment) {
+                panic!("Writing to an eventfd should consume exactly 8 bytes")
+            }
+
+            Ok(())
+        }
+    }
+}
+
+pub struct AioReadResultFuture<'a, ReadWriteHandle> where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
+    context: &'a AioContext,
+    buffer: ReadWriteHandle,
+    request: iocb,
+    submitted: bool,
+
+    result: cell::RefCell<Option<Result<(), io::Error>>>,
+}
+
+impl <'a, ReadWriteHandle> futures::Future for AioReadResultFuture<'a, ReadWriteHandle> 
+    where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+        if let Some(result) = self.result.borrow_mut().take() {
+            // procesing has completed
+            return result.map(|_| futures::Async::Ready(()));
+        } 
+
+        if !self.submitted {
+            // See if we can secure a submission slot
+            match self.context.capacity.borrow_mut().read() {
+                Err(err) => return Err(err),
+                Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+                Ok(futures::Async::Ready(_)) => (),
+            }
+
+            // Have space in the submission queue, now submit the I/O request
+            self.request.aio_data = unsafe { mem::transmute(self as *mut Self) };
+            self.request.aio_buf = unsafe { mem::transmute(self.buffer.deref_mut().as_ptr()) };
+            self.request.aio_nbytes = self.buffer.deref_mut().len() as u64; 
+
+            // submit the request
+            let mut request_ptr_array: [*mut iocb;1] = [&mut self.request as *mut iocb; 1];
+            let result = unsafe { io_submit(self.context.context, 1, &mut request_ptr_array[0] as *mut *mut iocb) };
+            self.submitted = true;
+
+            // if we have submission error, capture it as future result
+            if result == -1 {
+                return Err(io::Error::last_os_error());
+            }
+
+            // otherwise, let the future be triggered by availability of results and return not ready
+            Ok(futures::Async::NotReady)
+        } else {
+            // See if we should look up completion events
+            match self.context.completed.borrow_mut().read() {
+                Err(err) => return Err(err),
+                Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+                Ok(futures::Async::Ready(_)) => (),
+            }
+
+            // get completion events
+            let mut events = self.context.completion_events.borrow_mut();
+            events.clear();
+
+            unsafe {
+                let result = 
+                    io_getevents(self.context.context, 0 as c_long, events.capacity() as c_long, 
+                        events.as_mut_ptr(), ptr::null_mut::<timespec>());
+
+                // adjust the vector size to the actual number of items returned
+                if result >= 0 {
+                    events.set_len(result as usize);
+                } else {
+                    return Err(io::Error::last_os_error());
+                }
+            };
+
+            for ref event in events.iter() {
+                // TODO: need to refactor this to have a common element across memory handle types
+                let future: &Self = unsafe { mem::transmute(event.data) };
+                let result = event.res;
+
+                *future.result.borrow_mut() = 
+                    if result < 0 {
+                        Some(Err(io::Error::from_raw_os_error(result as i32)))
+                    } else {
+                        Some(Ok(()))
+                    };
+            }
+
+            // Release the kernel queue slots we just processed
+            if let Err(err) = self.context.completed.borrow_mut().add(events.len() as u64) {
+                return Err(err);
+            }
+
+            if let Some(result) = self.result.borrow_mut().take() {
+                // procesing has completed
+                result.map(|_| futures::Async::Ready(()))
+            } else {
+                // otherwise, register this future on the completion fd and return not ready
+                self.context.completed.borrow_mut().evented.need_read().map(|_| futures::Async::NotReady)
+            }
+        }
+    }
+}
+
+pub struct AioWriteResultFuture<'a, ReadOnlyHandle> where ReadOnlyHandle: ops::Deref<Target = [u8]> {
+    context: &'a AioContext,
+    buffer: ReadOnlyHandle,
+    request: iocb,
+    submitted: bool,
+
+    // this will get filled in when the result or error code becomes available
+    result: cell::RefCell<Option<Result<(), io::Error>>>,
+}
+
+impl <'a, ReadOnlyHandle> futures::Future for AioWriteResultFuture<'a, ReadOnlyHandle> 
+    where ReadOnlyHandle: ops::Deref<Target = [u8]> {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+        unimplemented!()
+    }
 }
 
 // AioContext Implementation
 
 struct AioContext {
+    // the context handle for submitting AIO requests to the kernel
+    context: aio_context_t,
+
     // event fd to signal that we can accept more I/O requests
-    can_submit: EventFd,
+    capacity: cell::RefCell<EventFd>,
 
     // event fd indicating that I/O requests have been completed
-    completed: EventFd,
+    completed: cell::RefCell<EventFd>,
 
+    // vector of IO completion events; retrieved via io_getevents
+    completion_events: cell::RefCell<Vec<io_event>>,
 }
 
 impl AioContext {
-    
+    /// Create a new AioContext that is driven by the provided event loop.
+    /// 
+    /// # Params
+    /// - handle: Reference to the event loop that is responsible fro driving this context
+    /// - nr: Number of submission slots fro IO requests
+    pub fn new(handle: &reactor::Handle, nr: usize) -> AioContext {
+        let mut context: aio_context_t = 0;
+
+        unsafe {
+            if io_setup(nr as c_long, &mut context) != 0 {
+                panic!("System error creating aio_context_t");
+            }
+        };
+
+        // TODO: Convert unwrap below to proper error handling using a Result type
+
+        AioContext {
+            context,
+            capacity: cell::RefCell::new(EventFd::create(handle, nr, true).unwrap()),
+            completed: cell::RefCell::new(EventFd::create(handle, 0, false).unwrap()),
+            completion_events: cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn submit_read<'a, ReadWriteHandle>(&'a mut self, fd: RawFd, offset: u64, buffer: ReadWriteHandle) ->
+        AioReadResultFuture<'a, ReadWriteHandle> where ReadWriteHandle: ops::DerefMut<Target = [u8]> {
+        // nothing really happens here until someone calls poll
+        AioReadResultFuture { context: self, buffer, 
+            request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset), 
+            submitted: false, result: cell::RefCell::new(None) }
+    }
+
+    pub fn submit_write<'a, ReadOnlyHandle>(&'a mut self, fd: RawFd, offset: u64, buffer: ReadOnlyHandle) ->
+        AioWriteResultFuture<'a, ReadOnlyHandle> where ReadOnlyHandle: ops::Deref<Target = [u8]> {
+        // nothing really happens here until someone calls poll
+        AioWriteResultFuture { context: self, buffer, 
+            request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset), 
+            submitted: false, result: cell::RefCell::new(None) }
+    }
+
+    fn init_iocb(&self, opcode: u32, fd: RawFd, offset: u64) -> iocb {
+        let mut result: iocb = unsafe { mem::zeroed() };
+
+        result.aio_fildes = fd as u32;
+        result.aio_offset = offset as i64;
+        result.aio_lio_opcode = opcode as u16;
+        result.aio_flags = IOCB_FLAG_RESFD;
+        result.aio_resfd = self.completed.borrow().evented.get_ref().fd as u32;
+
+        result
+    }
 }
