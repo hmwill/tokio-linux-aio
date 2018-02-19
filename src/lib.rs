@@ -1,3 +1,4 @@
+// ===============================================================================================
 // Copyright (c) 2018 Hans-Martin Will
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -17,6 +18,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+// ===============================================================================================
 
 extern crate aio_bindings;
 extern crate futures;
@@ -24,34 +26,55 @@ extern crate libc;
 extern crate mio;
 extern crate tokio;
 
-use std::os::unix::io::RawFd;
 use std::cell;
 use std::io;
 use std::mem;
 use std::ops;
 use std::ptr;
 
+use std::os::unix::io::RawFd;
+
 use libc::{c_long, c_uint, close, eventfd, read, write, EAGAIN, O_CLOEXEC};
+
+use tokio::reactor;
+
+// Relevant symbols from the native bindings exposed via aio-bindings
 use aio_bindings::{aio_context_t, io_event, iocb, syscall, timespec, __NR_io_destroy,
                    __NR_io_getevents, __NR_io_setup, __NR_io_submit, EFD_NONBLOCK, EFD_SEMAPHORE,
                    IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IOCB_FLAG_RESFD};
-use tokio::reactor;
 
+// -----------------------------------------------------------------------------------------------
+// Inline functions that wrap the kernel calls for the entry points corresponding to Liux
+// AIO functions
+// -----------------------------------------------------------------------------------------------
+
+// Initialize an AIO context for a given submission queue size within the kernel.
+//
+// See [io_setup(7)](http://man7.org/linux/man-pages/man2/io_setup.2.html) for details.
 #[inline(always)]
 unsafe fn io_setup(nr: c_long, ctxp: *mut aio_context_t) -> c_long {
     syscall(__NR_io_setup as c_long, nr, ctxp)
 }
 
+// Destroy an AIO context.
+//
+// See [io_destroy(7)](http://man7.org/linux/man-pages/man2/io_destroy.2.html) for details.
 #[inline(always)]
 unsafe fn io_destroy(ctx: aio_context_t) -> c_long {
     syscall(__NR_io_destroy as c_long, ctx)
 }
 
+// Submit a batch of IO operations.
+//
+// See [io_sumit(7)](http://man7.org/linux/man-pages/man2/io_submit.2.html) for details.
 #[inline(always)]
 unsafe fn io_submit(ctx: aio_context_t, nr: c_long, iocbpp: *mut *mut iocb) -> c_long {
     syscall(__NR_io_submit as c_long, ctx, nr, iocbpp)
 }
 
+// Retrieve completion events for previously submitted IO requests.
+//
+// See [io_getevents(7)](http://man7.org/linux/man-pages/man2/io_getevents.2.html) for details.
 #[inline(always)]
 unsafe fn io_getevents(
     ctx: aio_context_t,
@@ -70,7 +93,9 @@ unsafe fn io_getevents(
     )
 }
 
+// -----------------------------------------------------------------------------------------------
 // EventFd Implementation
+// -----------------------------------------------------------------------------------------------
 
 struct EventFdInner {
     fd: RawFd,
@@ -148,8 +173,8 @@ impl EventFd {
         let result = unsafe {
             read(
                 fd,
-                mem::transmute(&mut result as *mut u64),
-                mem::size_of_val(&result),
+                mem::transmute(&mut result),
+                mem::size_of::<u64>(),
             )
         };
 
@@ -167,8 +192,8 @@ impl EventFd {
                 }
             }
         } else {
-            if result as usize != mem::size_of_val(&result) {
-                panic!("Writing to an eventfd should consume exactly 8 bytes")
+            if result as usize != mem::size_of::<u64>() {
+                panic!("Writing to an eventfd should consume exactly {} bytes", mem::size_of::<u64>())
             }
 
             Ok(futures::Async::Ready(result as u64))
@@ -181,8 +206,8 @@ impl EventFd {
         let result = unsafe {
             write(
                 fd,
-                mem::transmute(&increment as *const u64),
-                mem::size_of_val(&increment),
+                mem::transmute(&increment),
+                mem::size_of::<u64>(),
             )
         };
 
@@ -190,7 +215,7 @@ impl EventFd {
             Err(io::Error::last_os_error())
         } else {
             if result as usize != mem::size_of_val(&increment) {
-                panic!("Writing to an eventfd should consume exactly 8 bytes")
+                panic!("Writing to an eventfd should consume exactly {} bytes", mem::size_of::<u64>())
             }
 
             Ok(())
@@ -198,15 +223,24 @@ impl EventFd {
     }
 }
 
+// Common interface in order to initialize an embedded iocb control block.
 trait IocbSetup {
     fn setup(&mut self);
 }
 
+// Common data structures for futures return by `AioContext`.
 struct AioBaseFuture<'a> {
+    // reference to the `AioContext` that controls the submission queue for asynchronous I/O
     context: &'a AioContext,
+
+    // the iocb control block that is used for queue submissions
     request: iocb,
+
+    // state variable tracking if the I/O request associated with this instance has been submitted
+    // to the kernel.
     submitted: bool,
 
+    // place to capture the result of the I/O operation
     result: Option<Result<(), io::Error>>,
 }
 
@@ -304,11 +338,15 @@ impl<'a> AioBaseFuture<'a> {
     }
 }
 
+/// Future returned as result of submitting a read request via `AioContext::read`.
 pub struct AioReadResultFuture<'a, ReadWriteHandle>
 where
     ReadWriteHandle: ops::DerefMut<Target = [u8]>,
 {
+    // common AIO future state
     base: AioBaseFuture<'a>,
+
+    // memory handle where data read from the underlying block device is being written to.
     buffer: ReadWriteHandle,
 }
 
@@ -341,11 +379,15 @@ where
     }
 }
 
+/// Future returned as result of submitting a write request via `AioContext::write`.
 pub struct AioWriteResultFuture<'a, ReadOnlyHandle>
 where
     ReadOnlyHandle: ops::Deref<Target = [u8]>,
 {
+    // common AIO future state
     base: AioBaseFuture<'a>,
+
+    // memory handle where data written to the underlying block device is being read from.
     buffer: ReadOnlyHandle,
 }
 
@@ -380,6 +422,8 @@ where
 
 // AioContext Implementation
 
+/// AioContext provides a submission queue for asycnronous I/O operations to
+/// block devices within the Linux kernel.
 pub struct AioContext {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
@@ -417,7 +461,7 @@ impl AioContext {
         })
     }
 
-    pub fn submit_read<'a, ReadWriteHandle>(
+    pub fn read<'a, ReadWriteHandle>(
         &'a self,
         fd: RawFd,
         offset: u64,
@@ -440,7 +484,7 @@ impl AioContext {
         }
     }
 
-    pub fn submit_write<'a, ReadOnlyHandle>(
+    pub fn write<'a, ReadOnlyHandle>(
         &'a self,
         fd: RawFd,
         offset: u64,
@@ -479,6 +523,7 @@ impl AioContext {
 
 impl Drop for AioContext {
     fn drop(&mut self) {
-        unsafe { io_destroy(self.context) };
+        let result = unsafe { io_destroy(self.context) };
+        assert!(result == 0);
     }
 }
