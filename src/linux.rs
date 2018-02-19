@@ -293,10 +293,14 @@ where
     ReadWriteHandle: ops::DerefMut<Target = [u8]>,
 {
     fn setup(&mut self) {
-        self.base.request.aio_data =
-            unsafe { mem::transmute(&mut self.base as *mut AioBaseFuture) };
-        self.base.request.aio_buf = unsafe { mem::transmute(self.buffer.deref_mut().as_ptr()) };
-        self.base.request.aio_nbytes = self.buffer.deref_mut().len() as u64;
+        unsafe {
+            if self.base.request.aio_data == 0 {
+                self.base.request.aio_data = mem::transmute(&mut self.base);
+                self.base.request.aio_buf = mem::transmute(self.buffer.as_ptr());
+            } else if self.base.request.aio_data != mem::transmute(&mut self.base) {
+                panic!("Future was moved during I/O operation");
+            }
+        }
     }
 }
 
@@ -326,10 +330,14 @@ where
     ReadOnlyHandle: ops::Deref<Target = [u8]>,
 {
     fn setup(&mut self) {
-        self.base.request.aio_data =
-            unsafe { mem::transmute(&mut self.base as *mut AioBaseFuture) };
-        self.base.request.aio_buf = unsafe { mem::transmute(self.buffer.deref().as_ptr()) };
-        self.base.request.aio_nbytes = self.buffer.deref().len() as u64;
+        unsafe {
+            if self.base.request.aio_data == 0 {
+                self.base.request.aio_data = mem::transmute(&mut self.base);
+                self.base.request.aio_buf = mem::transmute(self.buffer.as_ptr());
+            } else if self.base.request.aio_data != mem::transmute(&mut self.base) {
+                panic!("Future was moved during I/O operation");
+            }
+        }
     }
 }
 
@@ -394,11 +402,13 @@ impl AioContext {
     where
         ReadWriteHandle: ops::DerefMut<Target = [u8]>,
     {
+        let len = buffer.len() as u64;
+
         // nothing really happens here until someone calls poll
         AioReadResultFuture {
             base: AioBaseFuture {
                 context: self,
-                request: self.init_iocb(IOCB_CMD_PREAD, fd, offset),
+                request: self.init_iocb(IOCB_CMD_PREAD, fd, offset, len),
                 submitted: false,
                 result: None,
             },
@@ -415,11 +425,13 @@ impl AioContext {
     where
         ReadOnlyHandle: ops::Deref<Target = [u8]>,
     {
+        let len = buffer.len() as u64;
+
         // nothing really happens here until someone calls poll
         AioWriteResultFuture {
             base: AioBaseFuture {
                 context: self,
-                request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset),
+                request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset, len),
                 submitted: false,
                 result: None,
             },
@@ -427,11 +439,12 @@ impl AioContext {
         }
     }
 
-    fn init_iocb(&self, opcode: u32, fd: RawFd, offset: u64) -> iocb {
+    fn init_iocb(&self, opcode: u32, fd: RawFd, offset: u64, len: u64) -> iocb {
         let mut result: iocb = unsafe { mem::zeroed() };
 
         result.aio_fildes = fd as u32;
         result.aio_offset = offset as i64;
+        result.aio_nbytes = len;
         result.aio_lio_opcode = opcode as u16;
         result.aio_flags = IOCB_FLAG_RESFD;
         result.aio_resfd = self.completed.borrow().evented.get_ref().fd as u32;
