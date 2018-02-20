@@ -25,6 +25,7 @@ extern crate futures;
 extern crate libc;
 extern crate mio;
 extern crate tokio;
+extern crate tokio_core;
 
 use std::cell;
 use std::io;
@@ -36,7 +37,9 @@ use std::os::unix::io::RawFd;
 
 use libc::{c_long, c_uint, close, eventfd, read, write, EAGAIN, O_CLOEXEC};
 
+use tokio::executor;
 use tokio::reactor;
+use futures::Future;
 
 // Relevant symbols from the native bindings exposed via aio-bindings
 use aio_bindings::{aio_context_t, io_event, iocb, syscall, timespec, __NR_io_destroy,
@@ -163,11 +166,13 @@ impl EventFd {
 
     fn read(&mut self) -> Result<futures::Async<u64>, io::Error> {
         match self.evented.poll_read() {
-            futures::Async::NotReady => return Ok(futures::Async::NotReady),
+            futures::Async::NotReady => {
+                return Ok(futures::Async::NotReady)
+            },
             _ => (),
         };
 
-        let fd = { self.evented.get_ref().fd };
+        let fd = self.evented.get_ref().fd;
         let mut result: u64 = 0;
 
         let result = unsafe {
@@ -222,6 +227,45 @@ impl EventFd {
         }
     }
 }
+
+impl futures::Future for EventFd {
+    type Item = u64;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+        self.read()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::executor::current_thread;
+    use futures::future::lazy;
+    use super::*;
+
+    #[test]
+    fn read_eventfd() {
+        let core = tokio::reactor::Reactor::new().unwrap();
+        let handle = core.handle();
+
+        let efd = EventFd::create(&handle, 1, false).unwrap();
+
+        current_thread::run(|_| {
+            current_thread::spawn(lazy (move || {
+                let result = efd.wait();
+
+                assert!(result.is_ok());
+                assert!(result.unwrap() == 1);
+                
+                Ok(())
+            }));
+        });
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// Bindings for Linux AIO start here
+// -----------------------------------------------------------------------------------------------
 
 // Common interface in order to initialize an embedded iocb control block.
 trait IocbSetup {
@@ -419,8 +463,6 @@ where
         self.base.poll()
     }
 }
-
-// AioContext Implementation
 
 /// AioContext provides a submission queue for asycnronous I/O operations to
 /// block devices within the Linux kernel.
