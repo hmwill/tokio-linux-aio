@@ -145,10 +145,7 @@ struct EventFd {
 }
 
 impl EventFd {
-    fn create(
-        init: usize,
-        semaphore: bool,
-    ) -> Result<EventFd, io::Error> {
+    fn create(init: usize, semaphore: bool) -> Result<EventFd, io::Error> {
         let flags = if semaphore {
             O_CLOEXEC | EFD_NONBLOCK as i32 | EFD_SEMAPHORE as i32
         } else {
@@ -167,22 +164,14 @@ impl EventFd {
 
     fn read(&mut self) -> Result<futures::Async<u64>, io::Error> {
         match self.evented.poll_read() {
-            futures::Async::NotReady => {
-                return Ok(futures::Async::NotReady)
-            },
+            futures::Async::NotReady => return Ok(futures::Async::NotReady),
             _ => (),
         };
 
         let fd = self.evented.get_ref().fd;
         let mut result: u64 = 0;
 
-        let rc = unsafe {
-            read(
-                fd,
-                mem::transmute(&mut result),
-                mem::size_of::<u64>(),
-            )
-        };
+        let rc = unsafe { read(fd, mem::transmute(&mut result), mem::size_of::<u64>()) };
 
         if rc < 0 {
             let error = io::Error::last_os_error();
@@ -199,7 +188,10 @@ impl EventFd {
             }
         } else {
             if rc as usize != mem::size_of::<u64>() {
-                panic!("Writing to an eventfd should consume exactly {} bytes", mem::size_of::<u64>())
+                panic!(
+                    "Writing to an eventfd should consume exactly {} bytes",
+                    mem::size_of::<u64>()
+                )
             }
 
             Ok(futures::Async::Ready(result as u64))
@@ -209,19 +201,16 @@ impl EventFd {
     fn add(&mut self, increment: u64) -> Result<(), io::Error> {
         let fd = { self.evented.get_ref().fd };
 
-        let result = unsafe {
-            write(
-                fd,
-                mem::transmute(&increment),
-                mem::size_of::<u64>(),
-            )
-        };
+        let result = unsafe { write(fd, mem::transmute(&increment), mem::size_of::<u64>()) };
 
         if result == -1 {
             Err(io::Error::last_os_error())
         } else {
             if result as usize != mem::size_of_val(&increment) {
-                panic!("Writing to an eventfd should consume exactly {} bytes", mem::size_of::<u64>())
+                panic!(
+                    "Writing to an eventfd should consume exactly {} bytes",
+                    mem::size_of::<u64>()
+                )
             }
 
             Ok(())
@@ -269,22 +258,20 @@ mod tests {
             let fd = efd.evented.get_ref().fd;
 
             // The execution context is setup, futures may be executed.
-            current_thread::spawn(efd.map(|res| { assert!(res == 1); } ).map_err(|_| { panic!("Error!!!"); }));
+            current_thread::spawn(efd.map(|res| {
+                assert!(res == 1);
+            }).map_err(|_| {
+                panic!("Error!!!");
+            }));
 
             current_thread::spawn(lazy(move || {
                 let increment: u64 = 1;
 
-                let result = unsafe {
-                    write(
-                        fd,
-                        mem::transmute(&increment),
-                        mem::size_of::<u64>(),
-                    )
-                };
+                let result =
+                    unsafe { write(fd, mem::transmute(&increment), mem::size_of::<u64>()) };
                 assert!(result as usize == mem::size_of::<u64>());
                 Ok(())
             }));
-
         });
     }
 }
