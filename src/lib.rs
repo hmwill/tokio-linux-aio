@@ -25,13 +25,15 @@ extern crate futures;
 extern crate libc;
 extern crate mio;
 extern crate tokio;
-extern crate tokio_core;
 
 use std::cell;
 use std::io;
 use std::mem;
 use std::ops;
+use std::ops::{Deref, DerefMut};
 use std::ptr;
+use std::rc;
+use std::sync;
 
 use std::os::unix::io::RawFd;
 
@@ -144,7 +146,6 @@ struct EventFd {
 
 impl EventFd {
     fn create(
-        handle: &reactor::Handle,
         init: usize,
         semaphore: bool,
     ) -> Result<EventFd, io::Error> {
@@ -159,7 +160,7 @@ impl EventFd {
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
-            reactor::PollEvented::new(EventFdInner { fd }, handle)
+            reactor::PollEvented::new(EventFdInner { fd }, &reactor::Handle::default())
                 .map(|evented| EventFd { evented })
         }
     }
@@ -175,7 +176,7 @@ impl EventFd {
         let fd = self.evented.get_ref().fd;
         let mut result: u64 = 0;
 
-        let result = unsafe {
+        let rc = unsafe {
             read(
                 fd,
                 mem::transmute(&mut result),
@@ -183,7 +184,7 @@ impl EventFd {
             )
         };
 
-        if result < 0 {
+        if rc < 0 {
             let error = io::Error::last_os_error();
 
             if error.raw_os_error().unwrap() != EAGAIN {
@@ -197,7 +198,7 @@ impl EventFd {
                 }
             }
         } else {
-            if result as usize != mem::size_of::<u64>() {
+            if rc as usize != mem::size_of::<u64>() {
                 panic!("Writing to an eventfd should consume exactly {} bytes", mem::size_of::<u64>())
             }
 
@@ -244,21 +245,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_eventfd() {
-        let core = tokio::reactor::Reactor::new().unwrap();
-        let handle = core.handle();
+    fn read_eventfd_standard() {
+        let efd = EventFd::create(2, false).unwrap();
+        let result = efd.wait();
 
-        let efd = EventFd::create(&handle, 1, false).unwrap();
+        assert!(result.is_ok());
+        assert!(result.unwrap() == 2);
+    }
 
+    #[test]
+    fn read_eventfd_semaphore() {
+        let efd = EventFd::create(2, true).unwrap();
+        let result = efd.wait();
+
+        assert!(result.is_ok());
+        assert!(result.unwrap() == 1);
+    }
+
+    #[test]
+    fn read_add_eventfd() {
         current_thread::run(|_| {
-            current_thread::spawn(lazy (move || {
-                let result = efd.wait();
+            let efd = EventFd::create(0, false).unwrap();
+            let fd = efd.evented.get_ref().fd;
 
-                assert!(result.is_ok());
-                assert!(result.unwrap() == 1);
-                
+            // The execution context is setup, futures may be executed.
+            current_thread::spawn(efd.map(|res| { assert!(res == 1); } ).map_err(|_| { panic!("Error!!!"); }));
+
+            current_thread::spawn(lazy(move || {
+                let increment: u64 = 1;
+
+                let result = unsafe {
+                    write(
+                        fd,
+                        mem::transmute(&increment),
+                        mem::size_of::<u64>(),
+                    )
+                };
+                assert!(result as usize == mem::size_of::<u64>());
                 Ok(())
             }));
+
         });
     }
 }
@@ -484,9 +510,8 @@ impl AioContext {
     /// Create a new AioContext that is driven by the provided event loop.
     ///
     /// # Params
-    /// - handle: Reference to the event loop that is responsible fro driving this context
     /// - nr: Number of submission slots fro IO requests
-    pub fn new(handle: &reactor::Handle, nr: usize) -> Result<AioContext, io::Error> {
+    pub fn new(nr: usize) -> Result<AioContext, io::Error> {
         let mut context: aio_context_t = 0;
 
         unsafe {
@@ -497,8 +522,8 @@ impl AioContext {
 
         Ok(AioContext {
             context,
-            capacity: cell::RefCell::new(EventFd::create(handle, nr, true)?),
-            completed: cell::RefCell::new(EventFd::create(handle, 0, false)?),
+            capacity: cell::RefCell::new(EventFd::create(nr, true)?),
+            completed: cell::RefCell::new(EventFd::create(0, false)?),
             completion_events: cell::RefCell::new(Vec::new()),
         })
     }
