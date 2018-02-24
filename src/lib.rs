@@ -21,10 +21,13 @@
 // ===============================================================================================
 
 extern crate aio_bindings;
+extern crate rand;
 extern crate futures;
 extern crate libc;
 extern crate mio;
 extern crate tokio;
+
+extern crate memmap;
 
 use std::cell;
 use std::io;
@@ -32,10 +35,11 @@ use std::mem;
 use std::ops;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
+use std::sync;
 
 use std::os::unix::io::RawFd;
 
-use libc::{c_long, c_uint, close, eventfd, read, write, EAGAIN, O_CLOEXEC};
+use libc::{c_long, c_int, c_uint, open, close, eventfd, read, write, EAGAIN, O_DIRECT, O_RDWR, O_CLOEXEC};
 
 use tokio::executor;
 use tokio::reactor;
@@ -107,10 +111,10 @@ trait IocbSetup {
     fn setup(&mut self);
 }
 
-// Common data structures for futures return by `AioContext`.
-struct AioBaseFuture<'a> {
+// Common data structures for futures returned by `AioContext`.
+struct AioBaseFuture {
     // reference to the `AioContext` that controls the submission queue for asynchronous I/O
-    context: &'a AioContext,
+    context: sync::Arc<AioContextInner>,
 
     // the iocb control block that is used for queue submissions
     request: iocb,
@@ -123,7 +127,7 @@ struct AioBaseFuture<'a> {
     result: Option<Result<(), io::Error>>,
 }
 
-impl<'a> AioBaseFuture<'a> {
+impl AioBaseFuture {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
         if let Some(result) = self.result.take() {
             // procesing has completed
@@ -140,6 +144,11 @@ impl<'a> AioBaseFuture<'a> {
 
             // submit the request
             let mut request_ptr_array: [*mut iocb; 1] = [&mut self.request as *mut iocb; 1];
+            assert!(self.request.aio_fildes > 0);
+            assert!(unsafe { (*request_ptr_array[0]).aio_fildes } == self.request.aio_fildes);
+            let rc = unsafe { libc::fcntl(self.request.aio_fildes as c_int, libc::F_GETFD) };
+            assert!(rc != -1);
+
             let result = unsafe {
                 io_submit(
                     self.context.context,
@@ -150,86 +159,87 @@ impl<'a> AioBaseFuture<'a> {
             self.submitted = true;
 
             // if we have submission error, capture it as future result
-            if result == -1 {
+            if result != 1 {
                 return Err(io::Error::last_os_error());
             }
+        }
 
-            // otherwise, let the future be triggered by availability of results and return not ready
-            Ok(futures::Async::NotReady)
-        } else {
-            // See if we should look up completion events
+        // See if we should look up completion events
+        let available = 
             match self.context.completed.borrow_mut().read() {
                 Err(err) => return Err(err),
                 Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                Ok(futures::Async::Ready(_)) => (),
-            }
-
-            // get completion events
-            let mut events = self.context.completion_events.borrow_mut();
-            events.clear();
-
-            unsafe {
-                let result = io_getevents(
-                    self.context.context,
-                    0 as c_long,
-                    events.capacity() as c_long,
-                    events.as_mut_ptr(),
-                    ptr::null_mut::<timespec>(),
-                );
-
-                // adjust the vector size to the actual number of items returned
-                if result >= 0 {
-                    events.set_len(result as usize);
-                } else {
-                    return Err(io::Error::last_os_error());
-                }
+                Ok(futures::Async::Ready(n)) => n,
             };
 
-            for ref event in events.iter() {
-                let future: &mut AioBaseFuture = unsafe { mem::transmute(event.data) };
-                let result = event.res;
+        // get completion events
+        let mut events = self.context.completion_events.borrow_mut();
+        events.clear();
 
-                future.result = if result < 0 {
-                    Some(Err(io::Error::from_raw_os_error(result as i32)))
-                } else {
-                    Some(Ok(()))
-                };
-            }
+        assert!(available as usize <= events.capacity());
 
-            // Release the kernel queue slots we just processed
-            if let Err(err) = self.context.completed.borrow_mut().add(events.len() as u64) {
-                return Err(err);
-            }
+        unsafe {
+            let result = io_getevents(
+                self.context.context,
+                available as c_long,
+                events.capacity() as c_long,
+                events.as_mut_ptr(),
+                ptr::null_mut::<timespec>(),
+            );
 
-            if let Some(result) = self.result.take() {
-                // procesing has completed
-                result.map(|_| futures::Async::Ready(()))
+            // adjust the vector size to the actual number of items returned
+            if result >= 0 {
+                events.set_len(result as usize);
             } else {
-                // otherwise, register this future on the completion fd and return not ready
-                self.context
-                    .completed
-                    .borrow_mut()
-                    .evented
-                    .need_read()
-                    .map(|_| futures::Async::NotReady)
+                panic!("Got an error: {:?}", io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
             }
+        };
+
+        for ref event in events.iter() {
+            let future: &mut AioBaseFuture = unsafe { mem::transmute(event.data) };
+            let result = event.res;
+
+            future.result = if result < 0 {
+                Some(Err(io::Error::from_raw_os_error(result as i32)))
+            } else {
+                Some(Ok(()))
+            };
+        }
+
+        // Release the kernel queue slots we just processed
+        if let Err(err) = self.context.completed.borrow_mut().add(events.len() as u64) {
+            return Err(err);
+        }
+
+        if let Some(result) = self.result.take() {
+            // procesing has completed
+            result.map(|_| futures::Async::Ready(()))
+        } else {
+            // otherwise, register this future on the completion fd and return not ready
+            self.context
+                .completed
+                .borrow_mut()
+                .evented
+                .need_read()
+                .map(|_| futures::Async::NotReady)
         }
     }
 }
 
 /// Future returned as result of submitting a read request via `AioContext::read`.
-pub struct AioReadResultFuture<'a, ReadWriteHandle>
+pub struct AioReadResultFuture<ReadWriteHandle>
 where
     ReadWriteHandle: ops::DerefMut<Target = [u8]>,
 {
     // common AIO future state
-    base: AioBaseFuture<'a>,
+    base: AioBaseFuture,
 
     // memory handle where data read from the underlying block device is being written to.
     buffer: ReadWriteHandle,
 }
 
-impl<'a, ReadWriteHandle> IocbSetup for AioReadResultFuture<'a, ReadWriteHandle>
+impl<ReadWriteHandle> IocbSetup for AioReadResultFuture<ReadWriteHandle>
 where
     ReadWriteHandle: ops::DerefMut<Target = [u8]>,
 {
@@ -245,7 +255,7 @@ where
     }
 }
 
-impl<'a, ReadWriteHandle> futures::Future for AioReadResultFuture<'a, ReadWriteHandle>
+impl<ReadWriteHandle> futures::Future for AioReadResultFuture<ReadWriteHandle>
 where
     ReadWriteHandle: ops::DerefMut<Target = [u8]>,
 {
@@ -259,18 +269,18 @@ where
 }
 
 /// Future returned as result of submitting a write request via `AioContext::write`.
-pub struct AioWriteResultFuture<'a, ReadOnlyHandle>
+pub struct AioWriteResultFuture<ReadOnlyHandle>
 where
     ReadOnlyHandle: ops::Deref<Target = [u8]>,
 {
     // common AIO future state
-    base: AioBaseFuture<'a>,
+    base: AioBaseFuture,
 
     // memory handle where data written to the underlying block device is being read from.
     buffer: ReadOnlyHandle,
 }
 
-impl<'a, ReadOnlyHandle> IocbSetup for AioWriteResultFuture<'a, ReadOnlyHandle>
+impl<ReadOnlyHandle> IocbSetup for AioWriteResultFuture<ReadOnlyHandle>
 where
     ReadOnlyHandle: ops::Deref<Target = [u8]>,
 {
@@ -286,7 +296,7 @@ where
     }
 }
 
-impl<'a, ReadOnlyHandle> futures::Future for AioWriteResultFuture<'a, ReadOnlyHandle>
+impl<ReadOnlyHandle> futures::Future for AioWriteResultFuture<ReadOnlyHandle>
 where
     ReadOnlyHandle: ops::Deref<Target = [u8]>,
 {
@@ -301,7 +311,7 @@ where
 
 /// AioContext provides a submission queue for asycnronous I/O operations to
 /// block devices within the Linux kernel.
-pub struct AioContext {
+struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
 
@@ -315,12 +325,12 @@ pub struct AioContext {
     completion_events: cell::RefCell<Vec<io_event>>,
 }
 
-impl AioContext {
+impl AioContextInner {
     /// Create a new AioContext that is driven by the provided event loop.
     ///
     /// # Params
     /// - nr: Number of submission slots fro IO requests
-    pub fn new(nr: usize) -> Result<AioContext, io::Error> {
+    fn new(nr: usize) -> Result<AioContextInner, io::Error> {
         let mut context: aio_context_t = 0;
 
         unsafe {
@@ -329,20 +339,39 @@ impl AioContext {
             }
         };
 
-        Ok(AioContext {
+        Ok(AioContextInner {
             context,
             capacity: cell::RefCell::new(eventfd::EventFd::create(nr, true)?),
             completed: cell::RefCell::new(eventfd::EventFd::create(0, false)?),
-            completion_events: cell::RefCell::new(Vec::new()),
+            completion_events: cell::RefCell::new(Vec::with_capacity(nr)),
+        })
+    }
+}
+
+impl Drop for AioContextInner {
+    fn drop(&mut self) {
+        let result = unsafe { io_destroy(self.context) };
+        assert!(result == 0);
+    }
+}
+
+pub struct AioContext {
+    inner: sync::Arc<AioContextInner>
+}
+
+impl AioContext {
+    fn new(nr: usize) -> Result<AioContext, io::Error> {
+        Ok(AioContext {
+            inner: sync::Arc::new(AioContextInner::new(nr)?)
         })
     }
 
-    pub fn read<'a, ReadWriteHandle>(
-        &'a self,
+    pub fn read<ReadWriteHandle>(
+        &self,
         fd: RawFd,
         offset: u64,
         buffer: ReadWriteHandle,
-    ) -> AioReadResultFuture<'a, ReadWriteHandle>
+    ) -> AioReadResultFuture<ReadWriteHandle>
     where
         ReadWriteHandle: ops::DerefMut<Target = [u8]>,
     {
@@ -351,7 +380,7 @@ impl AioContext {
         // nothing really happens here until someone calls poll
         AioReadResultFuture {
             base: AioBaseFuture {
-                context: self,
+                context: self.inner.clone(),
                 request: self.init_iocb(IOCB_CMD_PREAD, fd, offset, len),
                 submitted: false,
                 result: None,
@@ -360,12 +389,12 @@ impl AioContext {
         }
     }
 
-    pub fn write<'a, ReadOnlyHandle>(
-        &'a self,
+    pub fn write<ReadOnlyHandle>(
+        &self,
         fd: RawFd,
         offset: u64,
         buffer: ReadOnlyHandle,
-    ) -> AioWriteResultFuture<'a, ReadOnlyHandle>
+    ) -> AioWriteResultFuture<ReadOnlyHandle>
     where
         ReadOnlyHandle: ops::Deref<Target = [u8]>,
     {
@@ -374,7 +403,7 @@ impl AioContext {
         // nothing really happens here until someone calls poll
         AioWriteResultFuture {
             base: AioBaseFuture {
-                context: self,
+                context: self.inner.clone(),
                 request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset, len),
                 submitted: false,
                 result: None,
@@ -386,25 +415,156 @@ impl AioContext {
     fn init_iocb(&self, opcode: u32, fd: RawFd, offset: u64, len: u64) -> iocb {
         let mut result: iocb = unsafe { mem::zeroed() };
 
+        assert!(fd > 0);
+        let rc = unsafe { libc::fcntl(fd as c_int, libc::F_GETFD) };
+        assert!(rc != -1);
+
         result.aio_fildes = fd as u32;
         result.aio_offset = offset as i64;
         result.aio_nbytes = len;
         result.aio_lio_opcode = opcode as u16;
         result.aio_flags = IOCB_FLAG_RESFD;
-        result.aio_resfd = self.completed.borrow().evented.get_ref().fd as u32;
+        result.aio_resfd = self.inner.completed.borrow().evented.get_ref().fd as u32;
 
         result
     }
 }
 
-impl Drop for AioContext {
-    fn drop(&mut self) {
-        let result = unsafe { io_destroy(self.context) };
-        assert!(result == 0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
 
+    use std::env;
+    use std::error::Error;
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path;
+    use std::sync;
+
+    use rand::Rng;
+
+    use tokio::executor::current_thread;
+
+    use memmap;
+
+    // Create a temporary file name within the temporary directory configured in the environment.
+    fn temp_file_name() -> path::PathBuf {
+        let mut rng = rand::thread_rng();
+        let mut result = env::temp_dir();
+        let filename = format!("test-aio-{}.dat", rng.gen::<u64>());
+        result.push(filename);
+        result
+    }
+
+    // Create a temporary file with some content
+    fn create_temp_file(path: &path::Path) {
+        let mut file = fs::File::create(path).unwrap();
+        let mut data: [u8; 16384] = [0; 16384];
+
+        for index in 0 .. data.len() {
+            data[index] = index as u8;
+        }
+
+        let result = file.write(&data);
+        assert!(result.is_ok());
+    }
+
+    // Delete the temporary file
+    fn remove_file(path: &path::Path) {
+        fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_and_drop() {
+        let context = AioContext::new(10);
+        // drop
+    }
+
+    struct MemoryBlock {
+        bytes: cell::UnsafeCell<memmap::MmapMut>
+    }
+
+    impl MemoryBlock {
+        fn new() -> MemoryBlock {
+            MemoryBlock {
+                // for real uses, we'll have a buffer pool with locks associated with individual pages
+                // simplifying the logic here for test case development
+                bytes: cell::UnsafeCell::new(memmap::MmapMut::map_anon(8192).unwrap())
+            }
+        }
+    }
+
+    struct MemoryHandle {
+        block: sync::Arc<MemoryBlock>
+    }
+
+    impl MemoryHandle {
+        fn new() -> MemoryHandle {
+            MemoryHandle {
+                block: sync::Arc::new(MemoryBlock::new())
+            }
+        }
+    }
+
+    impl Clone for MemoryHandle {
+        fn clone(&self) -> MemoryHandle {
+            MemoryHandle {
+                block: self.block.clone()
+            }
+        }
+    }
+
+    impl ops::Deref for MemoryHandle {
+        type Target = [u8];
+
+        fn deref(&self) -> &Self::Target {
+            unsafe { mem::transmute (&(*self.block.bytes.get())[..]) }
+        }
+    }
+
+    impl ops::DerefMut for MemoryHandle {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            unsafe { mem::transmute (&mut (*self.block.bytes.get())[..]) }
+        }
+    }
+
+    #[test]
+    fn read_block() {
+        let file_name = temp_file_name();
+        create_temp_file(&file_name);
+
+        {
+            let fd = OwnedFd::new_from_raw_fd(unsafe { open(mem::transmute(file_name.as_os_str().as_bytes().as_ptr()), O_DIRECT | O_RDWR) });
+            assert!(fd.fd > 0);
+
+            current_thread::run(move |_| {
+                let context = AioContext::new(10).unwrap();
+                let buffer = MemoryHandle::new();
+                assert!(fd.fd > 0);
+                let read_future = context.read(fd.fd, 0, buffer).map_err(|err| { panic!("{:?}", err); });
+
+                current_thread::spawn(read_future);
+            });
+        }
+
+        remove_file(&file_name);
+    }
+
+    struct OwnedFd {
+        fd: RawFd
+    }
+
+    impl OwnedFd {
+        fn new_from_raw_fd(fd: RawFd) -> OwnedFd {
+            OwnedFd { fd }
+        }
+    }
+
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            //let result = unsafe { close(self.fd) };
+            //assert!(result == 0);
+        }
+    }
 }

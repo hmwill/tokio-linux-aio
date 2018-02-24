@@ -116,7 +116,7 @@ impl EventFd {
             let error = io::Error::last_os_error();
 
             if error.raw_os_error().unwrap() != EAGAIN {
-                // this is a regular eeror
+                // this is a regular error
                 return Err(io::Error::last_os_error());
             } else {
                 if let Err(err) = self.evented.need_read() {
@@ -128,11 +128,13 @@ impl EventFd {
         } else {
             if rc as usize != mem::size_of::<u64>() {
                 panic!(
-                    "Writing to an eventfd should consume exactly {} bytes",
+                    "Reading from an eventfd should transfer exactly {} bytes",
                     mem::size_of::<u64>()
                 )
             }
 
+            // eventfd should never return 0 value; it either blocks or fails with EAGAIN
+            assert!(result != 0);
             Ok(futures::Async::Ready(result as u64))
         }
     }
