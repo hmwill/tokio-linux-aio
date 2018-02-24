@@ -21,10 +21,10 @@
 // ===============================================================================================
 
 extern crate aio_bindings;
-extern crate rand;
 extern crate futures;
 extern crate libc;
 extern crate mio;
+extern crate rand;
 extern crate tokio;
 
 extern crate memmap;
@@ -33,22 +33,19 @@ use std::cell;
 use std::io;
 use std::mem;
 use std::ops;
-use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync;
 
 use std::os::unix::io::RawFd;
 
-use libc::{c_long, c_int, c_uint, open, close, eventfd, read, write, EAGAIN, O_DIRECT, O_RDWR, O_CLOEXEC};
+use libc::{c_int, c_long};
 
-use tokio::executor;
-use tokio::reactor;
 use futures::Future;
 
 // Relevant symbols from the native bindings exposed via aio-bindings
 use aio_bindings::{aio_context_t, io_event, iocb, syscall, timespec, __NR_io_destroy,
-                   __NR_io_getevents, __NR_io_setup, __NR_io_submit, EFD_NONBLOCK, EFD_SEMAPHORE,
-                   IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IOCB_FLAG_RESFD};
+                   __NR_io_getevents, __NR_io_setup, __NR_io_submit, IOCB_CMD_PREAD,
+                   IOCB_CMD_PWRITE, IOCB_FLAG_RESFD};
 
 mod eventfd;
 
@@ -165,12 +162,11 @@ impl AioBaseFuture {
         }
 
         // See if we should look up completion events
-        let available = 
-            match self.context.completed.borrow_mut().read() {
-                Err(err) => return Err(err),
-                Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                Ok(futures::Async::Ready(n)) => n,
-            };
+        let available = match self.context.completed.borrow_mut().read() {
+            Err(err) => return Err(err),
+            Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+            Ok(futures::Async::Ready(n)) => n,
+        };
 
         // get completion events
         let mut events = self.context.completion_events.borrow_mut();
@@ -191,7 +187,6 @@ impl AioBaseFuture {
             if result >= 0 {
                 events.set_len(result as usize);
             } else {
-                panic!("Got an error: {:?}", io::Error::last_os_error());
                 return Err(io::Error::last_os_error());
             }
         };
@@ -356,13 +351,13 @@ impl Drop for AioContextInner {
 }
 
 pub struct AioContext {
-    inner: sync::Arc<AioContextInner>
+    inner: sync::Arc<AioContextInner>,
 }
 
 impl AioContext {
     pub fn new(nr: usize) -> Result<AioContext, io::Error> {
         Ok(AioContext {
-            inner: sync::Arc::new(AioContextInner::new(nr)?)
+            inner: sync::Arc::new(AioContextInner::new(nr)?),
         })
     }
 
@@ -435,7 +430,6 @@ mod tests {
     use super::*;
 
     use std::env;
-    use std::error::Error;
     use std::fs;
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
@@ -447,6 +441,8 @@ mod tests {
     use tokio::executor::current_thread;
 
     use memmap;
+
+    use libc::{close, open, O_DIRECT, O_RDWR};
 
     // Create a temporary file name within the temporary directory configured in the environment.
     fn temp_file_name() -> path::PathBuf {
@@ -462,7 +458,7 @@ mod tests {
         let mut file = fs::File::create(path).unwrap();
         let mut data: [u8; 16384] = [0; 16384];
 
-        for index in 0 .. data.len() {
+        for index in 0..data.len() {
             data[index] = index as u8;
         }
 
@@ -472,17 +468,17 @@ mod tests {
 
     // Delete the temporary file
     fn remove_file(path: &path::Path) {
-        fs::remove_file(path);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn create_and_drop() {
-        let context = AioContext::new(10);
+        let _ = AioContext::new(10);
         // drop
     }
 
     struct MemoryBlock {
-        bytes: cell::UnsafeCell<memmap::MmapMut>
+        bytes: cell::UnsafeCell<memmap::MmapMut>,
     }
 
     impl MemoryBlock {
@@ -490,19 +486,19 @@ mod tests {
             MemoryBlock {
                 // for real uses, we'll have a buffer pool with locks associated with individual pages
                 // simplifying the logic here for test case development
-                bytes: cell::UnsafeCell::new(memmap::MmapMut::map_anon(8192).unwrap())
+                bytes: cell::UnsafeCell::new(memmap::MmapMut::map_anon(8192).unwrap()),
             }
         }
     }
 
     struct MemoryHandle {
-        block: sync::Arc<MemoryBlock>
+        block: sync::Arc<MemoryBlock>,
     }
 
     impl MemoryHandle {
         fn new() -> MemoryHandle {
             MemoryHandle {
-                block: sync::Arc::new(MemoryBlock::new())
+                block: sync::Arc::new(MemoryBlock::new()),
             }
         }
     }
@@ -510,7 +506,7 @@ mod tests {
     impl Clone for MemoryHandle {
         fn clone(&self) -> MemoryHandle {
             MemoryHandle {
-                block: self.block.clone()
+                block: self.block.clone(),
             }
         }
     }
@@ -519,13 +515,13 @@ mod tests {
         type Target = [u8];
 
         fn deref(&self) -> &Self::Target {
-            unsafe { mem::transmute (&(*self.block.bytes.get())[..]) }
+            unsafe { mem::transmute(&(*self.block.bytes.get())[..]) }
         }
     }
 
     impl ops::DerefMut for MemoryHandle {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            unsafe { mem::transmute (&mut (*self.block.bytes.get())[..]) }
+            unsafe { mem::transmute(&mut (*self.block.bytes.get())[..]) }
         }
     }
 
@@ -535,17 +531,24 @@ mod tests {
         create_temp_file(&file_name);
 
         {
-            let owned_fd = OwnedFd::new_from_raw_fd(unsafe { open(mem::transmute(file_name.as_os_str().as_bytes().as_ptr()), O_DIRECT | O_RDWR) });
+            let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
+                open(
+                    mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
+                    O_DIRECT | O_RDWR,
+                )
+            });
             let fd = owned_fd.fd;
 
             current_thread::run(move |_| {
                 let context = AioContext::new(10).unwrap();
                 let buffer = MemoryHandle::new();
                 let result_buffer = buffer.clone();
-                let read_future = 
-                    context.read(fd, 0, buffer)
-                        .map(move |_| { assert!(validate_block(&result_buffer)) })
-                        .map_err(|err| { panic!("{:?}", err); });
+                let read_future = context
+                    .read(fd, 0, buffer)
+                    .map(move |_| assert!(validate_block(&result_buffer)))
+                    .map_err(|err| {
+                        panic!("{:?}", err);
+                    });
 
                 current_thread::spawn(read_future);
             });
@@ -555,7 +558,7 @@ mod tests {
     }
 
     fn validate_block(data: &[u8]) -> bool {
-        for index in 0 .. data.len() {
+        for index in 0..data.len() {
             if data[index] != index as u8 {
                 return false;
             }
@@ -565,7 +568,7 @@ mod tests {
     }
 
     struct OwnedFd {
-        fd: RawFd
+        fd: RawFd,
     }
 
     impl OwnedFd {

@@ -25,14 +25,13 @@ use std::mem;
 
 use std::os::unix::io::RawFd;
 
-use libc::{c_long, c_uint, close, eventfd, read, write, EAGAIN, O_CLOEXEC};
+use libc::{c_uint, close, eventfd, read, write, EAGAIN, O_CLOEXEC};
 
 use futures;
 use futures::Future;
 
 use mio;
 
-use tokio::executor;
 use tokio::reactor;
 
 use aio_bindings::{EFD_NONBLOCK, EFD_SEMAPHORE};
