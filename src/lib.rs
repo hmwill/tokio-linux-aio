@@ -360,7 +360,7 @@ pub struct AioContext {
 }
 
 impl AioContext {
-    fn new(nr: usize) -> Result<AioContext, io::Error> {
+    pub fn new(nr: usize) -> Result<AioContext, io::Error> {
         Ok(AioContext {
             inner: sync::Arc::new(AioContextInner::new(nr)?)
         })
@@ -535,20 +535,33 @@ mod tests {
         create_temp_file(&file_name);
 
         {
-            let fd = OwnedFd::new_from_raw_fd(unsafe { open(mem::transmute(file_name.as_os_str().as_bytes().as_ptr()), O_DIRECT | O_RDWR) });
-            assert!(fd.fd > 0);
+            let owned_fd = OwnedFd::new_from_raw_fd(unsafe { open(mem::transmute(file_name.as_os_str().as_bytes().as_ptr()), O_DIRECT | O_RDWR) });
+            let fd = owned_fd.fd;
 
             current_thread::run(move |_| {
                 let context = AioContext::new(10).unwrap();
                 let buffer = MemoryHandle::new();
-                assert!(fd.fd > 0);
-                let read_future = context.read(fd.fd, 0, buffer).map_err(|err| { panic!("{:?}", err); });
+                let result_buffer = buffer.clone();
+                let read_future = 
+                    context.read(fd, 0, buffer)
+                        .map(move |_| { assert!(validate_block(&result_buffer)) })
+                        .map_err(|err| { panic!("{:?}", err); });
 
                 current_thread::spawn(read_future);
             });
         }
 
         remove_file(&file_name);
+    }
+
+    fn validate_block(data: &[u8]) -> bool {
+        for index in 0 .. data.len() {
+            if data[index] != index as u8 {
+                return false;
+            }
+        }
+
+        true
     }
 
     struct OwnedFd {
@@ -563,8 +576,8 @@ mod tests {
 
     impl Drop for OwnedFd {
         fn drop(&mut self) {
-            //let result = unsafe { close(self.fd) };
-            //assert!(result == 0);
+            let result = unsafe { close(self.fd) };
+            assert!(result == 0);
         }
     }
 }
