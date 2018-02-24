@@ -1,6 +1,6 @@
 [package]
 name = "tokio-linux-aio"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Hans-Martin Will <hwill@acm.org>"]
 description = "Tokio bindings for Linux kernel AIO"
 repository="https://github.com/hmwill/tokio-linux-aio"
