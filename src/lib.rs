@@ -141,10 +141,6 @@ impl AioBaseFuture {
 
             // submit the request
             let mut request_ptr_array: [*mut iocb; 1] = [&mut self.request as *mut iocb; 1];
-            assert!(self.request.aio_fildes > 0);
-            assert!(unsafe { (*request_ptr_array[0]).aio_fildes } == self.request.aio_fildes);
-            let rc = unsafe { libc::fcntl(self.request.aio_fildes as c_int, libc::F_GETFD) };
-            assert!(rc != -1);
 
             let result = unsafe {
                 io_submit(
@@ -171,7 +167,6 @@ impl AioBaseFuture {
         // get completion events
         let mut events = self.context.completion_events.borrow_mut();
         events.clear();
-
         assert!(available as usize <= events.capacity());
 
         unsafe {
@@ -409,10 +404,6 @@ impl AioContext {
 
     fn init_iocb(&self, opcode: u32, fd: RawFd, offset: u64, len: u64) -> iocb {
         let mut result: iocb = unsafe { mem::zeroed() };
-
-        assert!(fd > 0);
-        let rc = unsafe { libc::fcntl(fd as c_int, libc::F_GETFD) };
-        assert!(rc != -1);
 
         result.aio_fildes = fd as u32;
         result.aio_offset = offset as i64;
