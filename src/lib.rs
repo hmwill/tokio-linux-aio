@@ -28,6 +28,7 @@ extern crate rand;
 extern crate tokio;
 
 extern crate memmap;
+extern crate futures_cpupool;
 
 use std::cell;
 use std::io;
@@ -164,7 +165,8 @@ impl AioBaseFuture {
             Ok(futures::Async::Ready(n)) => n,
         };
 
-        // get completion events
+        // get completion events; we retrieve exactly the number indiceted in the 
+        // eventfd read-out.
         let mut events = self.context.completion_events.borrow_mut();
         events.clear();
         assert!(available as usize <= events.capacity());
@@ -173,7 +175,7 @@ impl AioBaseFuture {
             let result = io_getevents(
                 self.context.context,
                 available as c_long,
-                events.capacity() as c_long,
+                available as c_long,
                 events.as_mut_ptr(),
                 ptr::null_mut::<timespec>(),
             );
@@ -299,8 +301,6 @@ where
     }
 }
 
-/// AioContext provides a submission queue for asycnronous I/O operations to
-/// block devices within the Linux kernel.
 struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
@@ -316,10 +316,6 @@ struct AioContextInner {
 }
 
 impl AioContextInner {
-    /// Create a new AioContext that is driven by the provided event loop.
-    ///
-    /// # Params
-    /// - nr: Number of submission slots fro IO requests
     fn new(nr: usize) -> Result<AioContextInner, io::Error> {
         let mut context: aio_context_t = 0;
 
@@ -349,13 +345,23 @@ pub struct AioContext {
     inner: sync::Arc<AioContextInner>,
 }
 
+/// AioContext provides a submission queue for asycnronous I/O operations to
+/// block devices within the Linux kernel.
 impl AioContext {
+    /// Create a new AioContext that is driven by the provided event loop.
+    ///
+    /// # Params
+    /// - nr: Number of submission slots fro IO requests
     pub fn new(nr: usize) -> Result<AioContext, io::Error> {
         Ok(AioContext {
             inner: sync::Arc::new(AioContextInner::new(nr)?),
         })
     }
 
+    /// Initiate an asynchronous read operation on the given file descriptor for reading
+    /// data from the provided absolute file offset into the buffer. The buffer also determines
+    /// the number of bytes to be read, which should be a multiple of the underlying device block
+    /// size.
     pub fn read<ReadWriteHandle>(
         &self,
         fd: RawFd,
@@ -379,6 +385,10 @@ impl AioContext {
         }
     }
 
+    /// Initiate an asynchronous write operation on the given file descriptor for writing
+    /// data to the provided absolute file offset from the buffer. The buffer also determines
+    /// the number of bytes to be written, which should be a multiple of the underlying device block
+    /// size.
     pub fn write<ReadOnlyHandle>(
         &self,
         fd: RawFd,
@@ -432,6 +442,7 @@ mod tests {
     use tokio::executor::current_thread;
 
     use memmap;
+    use futures_cpupool;
 
     use libc::{close, open, O_DIRECT, O_RDWR};
 
@@ -543,6 +554,43 @@ mod tests {
 
                 current_thread::spawn(read_future);
             });
+        }
+
+        remove_file(&file_name);
+    }
+
+    #[test]
+    fn read_block_mt() {
+        let file_name = temp_file_name();
+        create_temp_file(&file_name);
+
+        {
+            let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
+                open(
+                    mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
+                    O_DIRECT | O_RDWR,
+                )
+            });
+            let fd = owned_fd.fd;
+
+            let pool = futures_cpupool::CpuPool::new(4);
+
+            {
+                let context = AioContext::new(10).unwrap();
+                let buffer = MemoryHandle::new();
+                let result_buffer = buffer.clone();
+                let read_future = context
+                    .read(fd, 0, buffer)
+                    .map(move |_| assert!(validate_block(&result_buffer)))
+                    .map_err(|err| {
+                        panic!("{:?}", err);
+                    });
+
+                let cpu_future = pool.spawn(read_future);
+                let result = cpu_future.wait();
+
+                assert!(result.is_ok());
+            }
         }
 
         remove_file(&file_name);
