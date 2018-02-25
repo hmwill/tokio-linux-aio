@@ -134,10 +134,20 @@ impl AioBaseFuture {
 
         if !self.submitted {
             // See if we can secure a submission slot
-            match self.context.capacity.borrow_mut().read() {
-                Err(err) => return Err(err),
-                Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                Ok(futures::Async::Ready(_)) => (),
+            {
+                let mut guard = self.context.capacity.write();
+
+                match guard {
+                    Ok(ref mut guard) => {
+                        match guard.read() {
+                            Err(err) => return Err(err),
+                            Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+                            Ok(futures::Async::Ready(_)) => (),
+                        }
+                    },
+                    Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
+                }
+
             }
 
             // submit the request
@@ -158,50 +168,55 @@ impl AioBaseFuture {
             }
         }
 
-        // See if we should look up completion events
-        let available = match self.context.completed.borrow_mut().read() {
-            Err(err) => return Err(err),
-            Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-            Ok(futures::Async::Ready(n)) => n,
-        };
+        match self.context.completed.write() {
+            Ok(ref mut guard) =>  {
+                // See if we should look up completion events
+                let available = match guard.event.read() {
+                    Err(err) => return Err(err),
+                    Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+                    Ok(futures::Async::Ready(n)) => n,
+                };
 
-        // get completion events; we retrieve exactly the number indiceted in the 
-        // eventfd read-out.
-        let mut events = self.context.completion_events.borrow_mut();
-        events.clear();
-        assert!(available as usize <= events.capacity());
+                // get completion events; we retrieve exactly the number indiceted in the 
+                // eventfd read-out.
+                guard.completion_events.clear();
+                assert!(available as usize <= guard.completion_events.capacity());
 
-        unsafe {
-            let result = io_getevents(
-                self.context.context,
-                available as c_long,
-                available as c_long,
-                events.as_mut_ptr(),
-                ptr::null_mut::<timespec>(),
-            );
+                unsafe {
+                    let result = io_getevents(
+                        self.context.context,
+                        available as c_long,
+                        available as c_long,
+                        guard.completion_events.as_mut_ptr(),
+                        ptr::null_mut::<timespec>(),
+                    );
 
-            // adjust the vector size to the actual number of items returned
-            if result >= 0 {
-                events.set_len(result as usize);
-            } else {
-                return Err(io::Error::last_os_error());
-            }
-        };
+                    // adjust the vector size to the actual number of items returned
+                    if result >= 0 {
+                        guard.completion_events.set_len(result as usize);
+                    } else {
+                        return Err(io::Error::last_os_error());
+                    }
+                };
 
-        for ref event in events.iter() {
-            let future: &mut AioBaseFuture = unsafe { mem::transmute(event.data) };
-            let result = event.res;
+                for ref event in guard.completion_events.iter() {
+                    let future: &mut AioBaseFuture = unsafe { mem::transmute(event.data) };
+                    let result = event.res;
 
-            future.result = if result < 0 {
-                Some(Err(io::Error::from_raw_os_error(result as i32)))
-            } else {
-                Some(Ok(()))
-            };
-        }
+                    future.result = if result < 0 {
+                        Some(Err(io::Error::from_raw_os_error(result as i32)))
+                    } else {
+                        Some(Ok(()))
+                    };
+                }
 
-        // Release the kernel queue slots we just processed
-        if let Err(err) = self.context.completed.borrow_mut().add(events.len() as u64) {
-            return Err(err);
+                // Release the kernel queue slots we just processed
+                let length = guard.completion_events.len() as u64;
+                if let Err(err) = guard.event.add(length) {
+                    return Err(err);
+                }
+            },
+            Err(_) => panic!("TODO: Figure out how to handle this error"),
         }
 
         if let Some(result) = self.result.take() {
@@ -209,10 +224,9 @@ impl AioBaseFuture {
             result.map(|_| futures::Async::Ready(()))
         } else {
             // otherwise, register this future on the completion fd and return not ready
-            self.context
-                .completed
-                .borrow_mut()
-                .evented
+            let mut guard = self.context.completed.write().unwrap();
+
+            guard.event.evented
                 .need_read()
                 .map(|_| futures::Async::NotReady)
         }
@@ -301,18 +315,33 @@ where
     }
 }
 
+struct CompletionState {
+    // event fd indicating that I/O requests have been completed
+    event: eventfd::EventFd,
+
+    // vector of IO completion events; retrieved via io_getevents
+    completion_events: Vec<io_event>,
+}
+
+impl CompletionState {
+    fn new(nr: usize) -> Result<CompletionState, io::Error> {
+        Ok(CompletionState {
+            event: eventfd::EventFd::create(0, false)?,
+            completion_events: Vec::with_capacity(nr),
+
+        })
+    }
+}
+
 struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
 
     // event fd to signal that we can accept more I/O requests
-    capacity: cell::RefCell<eventfd::EventFd>,
+    capacity: sync::RwLock<eventfd::EventFd>,
 
-    // event fd indicating that I/O requests have been completed
-    completed: cell::RefCell<eventfd::EventFd>,
-
-    // vector of IO completion events; retrieved via io_getevents
-    completion_events: cell::RefCell<Vec<io_event>>,
+    // state to process completed I/O events
+    completed: sync::RwLock<CompletionState>
 }
 
 impl AioContextInner {
@@ -327,9 +356,8 @@ impl AioContextInner {
 
         Ok(AioContextInner {
             context,
-            capacity: cell::RefCell::new(eventfd::EventFd::create(nr, true)?),
-            completed: cell::RefCell::new(eventfd::EventFd::create(0, false)?),
-            completion_events: cell::RefCell::new(Vec::with_capacity(nr)),
+            capacity: sync::RwLock::new(eventfd::EventFd::create(nr, true)?),
+            completed: sync::RwLock::new(CompletionState::new(nr)?),
         })
     }
 }
@@ -420,7 +448,10 @@ impl AioContext {
         result.aio_nbytes = len;
         result.aio_lio_opcode = opcode as u16;
         result.aio_flags = IOCB_FLAG_RESFD;
-        result.aio_resfd = self.inner.completed.borrow().evented.get_ref().fd as u32;
+
+        let guard = self.inner.completed.read().unwrap();
+
+        result.aio_resfd = guard.event.evented.get_ref().fd as u32;
 
         result
     }
@@ -480,7 +511,7 @@ mod tests {
     }
 
     struct MemoryBlock {
-        bytes: cell::UnsafeCell<memmap::MmapMut>,
+        bytes: sync::RwLock<memmap::MmapMut>,
     }
 
     impl MemoryBlock {
@@ -488,7 +519,7 @@ mod tests {
             MemoryBlock {
                 // for real uses, we'll have a buffer pool with locks associated with individual pages
                 // simplifying the logic here for test case development
-                bytes: cell::UnsafeCell::new(memmap::MmapMut::map_anon(8192).unwrap()),
+                bytes: sync::RwLock::new(memmap::MmapMut::map_anon(8192).unwrap()),
             }
         }
     }
@@ -517,13 +548,13 @@ mod tests {
         type Target = [u8];
 
         fn deref(&self) -> &Self::Target {
-            unsafe { mem::transmute(&(*self.block.bytes.get())[..]) }
+            unsafe { mem::transmute(&(*self.block.bytes.read().unwrap())[..]) }
         }
     }
 
     impl ops::DerefMut for MemoryHandle {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            unsafe { mem::transmute(&mut (*self.block.bytes.get())[..]) }
+            unsafe { mem::transmute(&mut (*self.block.bytes.write().unwrap())[..]) }
         }
     }
 
