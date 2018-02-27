@@ -27,8 +27,8 @@ extern crate mio;
 extern crate rand;
 extern crate tokio;
 
-extern crate memmap;
 extern crate futures_cpupool;
+extern crate memmap;
 
 use std::cell;
 use std::io;
@@ -109,13 +109,23 @@ struct AioBaseFuture {
     // reference to the `AioContext` that controls the submission queue for asynchronous I/O
     context: sync::Arc<AioContextInner>,
 
-    // the iocb control block that is used for queue submissions
-    opcode: u32, 
-    fd: RawFd, 
-    offset: u64, 
+    // field values that we need to transfer into the IOCB
+
+    // the I/O opcode
+    opcode: u32,
+
+    // file fd identifying the file to operate on
+    fd: RawFd,
+
+    // an absolute file offset, if applicable for the command
+    offset: u64,
+
+    // the base address of the transfer buffer, if applicable
     buf: u64,
+
+    // the number of bytes to be transferred, if applicable
     len: u64,
-    
+
     // state variable tracking if the I/O request associated with this instance has been submitted
     // to the kernel.
     submitted: bool,
@@ -156,15 +166,16 @@ impl AioBaseFuture {
                                 state.request.aio_buf = self.buf;
                                 state.request.aio_nbytes = self.len;
                                 state.request.aio_lio_opcode = self.opcode as u16;
-                            },
+                            }
                         }
-                    },
+                    }
                     Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
                 }
             }
 
             // submit the request
-            let mut request_ptr_array: [*mut iocb; 1] = [&mut self.state.as_mut().unwrap().request as *mut iocb; 1];
+            let mut request_ptr_array: [*mut iocb; 1] =
+                [&mut self.state.as_mut().unwrap().request as *mut iocb; 1];
 
             let result = unsafe {
                 io_submit(
@@ -194,7 +205,7 @@ impl AioBaseFuture {
 
         assert!(available == 1);
 
-        // get completion events; we retrieve exactly the number indiceted in the 
+        // get completion events; we retrieve exactly the number indiceted in the
         // eventfd read-out.
         let mut event: io_event = unsafe { mem::zeroed() };
 
@@ -226,11 +237,14 @@ impl AioBaseFuture {
             Ok(ref mut guard) => {
                 guard.state.push(self.state.take().unwrap());
                 guard.available.add(1)?;
-            },
+            }
             Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
         }
-            
-        Ok(futures::Async::Ready(()))
+
+        self.result
+            .take()
+            .unwrap()
+            .map(|_| futures::Async::Ready(()))
     }
 }
 
@@ -303,16 +317,14 @@ impl Capacity {
 
         // using a for loop to properly handle the error case
         // range map collect would only allow for using unwrap(), thereby turning an error into a panic
-        for _ in 0 .. nr {
+        for _ in 0..nr {
             state.push(Box::new(RequestState {
                 eventfd: eventfd::EventFd::create(0, false)?,
-                request: unsafe { mem::zeroed() } }));
+                request: unsafe { mem::zeroed() },
+            }));
         }
-        
-        Ok(Capacity {
-            available,
-            state,
-        })
+
+        Ok(Capacity { available, state })
     }
 }
 
@@ -320,7 +332,7 @@ struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
 
-    // pre-allocated eventfds and a capacity semaphore 
+    // pre-allocated eventfds and a capacity semaphore
     capacity: sync::RwLock<Capacity>,
 }
 
