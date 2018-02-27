@@ -104,22 +104,24 @@ unsafe fn io_getevents(
 // Bindings for Linux AIO start here
 // -----------------------------------------------------------------------------------------------
 
-// Common interface in order to initialize an embedded iocb control block within a future.
-trait IocbSetup {
-    fn setup(&mut self);
-}
-
 // Common data structures for futures returned by `AioContext`.
 struct AioBaseFuture {
     // reference to the `AioContext` that controls the submission queue for asynchronous I/O
     context: sync::Arc<AioContextInner>,
 
     // the iocb control block that is used for queue submissions
-    request: iocb,
-
+    opcode: u32, 
+    fd: RawFd, 
+    offset: u64, 
+    buf: u64,
+    len: u64,
+    
     // state variable tracking if the I/O request associated with this instance has been submitted
     // to the kernel.
     submitted: bool,
+
+    // the associated eventfd
+    state: Option<Box<RequestState>>,
 
     // place to capture the result of the I/O operation
     result: Option<Result<(), io::Error>>,
@@ -134,24 +136,35 @@ impl AioBaseFuture {
 
         if !self.submitted {
             // See if we can secure a submission slot
-            {
+            if self.state.is_none() {
                 let mut guard = self.context.capacity.write();
 
                 match guard {
                     Ok(ref mut guard) => {
-                        match guard.read() {
+                        match guard.available.read() {
                             Err(err) => return Err(err),
                             Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                            Ok(futures::Async::Ready(_)) => (),
+                            Ok(futures::Async::Ready(_)) => {
+                                // retrieve an eventfd from the set of available ones and move it into the future
+                                self.state = guard.state.pop();
+                                assert!(self.state.is_some());
+                                let state = self.state.as_mut().unwrap();
+                                state.request.aio_resfd = state.eventfd.evented.get_ref().fd as u32;
+                                state.request.aio_flags = IOCB_FLAG_RESFD;
+                                state.request.aio_fildes = self.fd as u32;
+                                state.request.aio_offset = self.offset as i64;
+                                state.request.aio_buf = self.buf;
+                                state.request.aio_nbytes = self.len;
+                                state.request.aio_lio_opcode = self.opcode as u16;
+                            },
                         }
                     },
                     Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
                 }
-
             }
 
             // submit the request
-            let mut request_ptr_array: [*mut iocb; 1] = [&mut self.request as *mut iocb; 1];
+            let mut request_ptr_array: [*mut iocb; 1] = [&mut self.state.as_mut().unwrap().request as *mut iocb; 1];
 
             let result = unsafe {
                 io_submit(
@@ -168,68 +181,56 @@ impl AioBaseFuture {
             }
         }
 
-        match self.context.completed.write() {
-            Ok(ref mut guard) =>  {
-                // See if we should look up completion events
-                let available = match guard.event.read() {
-                    Err(err) => return Err(err),
-                    Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                    Ok(futures::Async::Ready(n)) => n,
-                };
+        // Ensure that we have a completion eventfd assigned to the future
+        assert!(self.state.is_some());
 
-                // get completion events; we retrieve exactly the number indiceted in the 
-                // eventfd read-out.
-                guard.completion_events.clear();
-                assert!(available as usize <= guard.completion_events.capacity());
+        // just check the eventfd associated with the future
+        // See if we should look up completion events
+        let available = match self.state.as_mut().unwrap().eventfd.read() {
+            Err(err) => return Err(err),
+            Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+            Ok(futures::Async::Ready(n)) => n,
+        };
 
-                unsafe {
-                    let result = io_getevents(
-                        self.context.context,
-                        available as c_long,
-                        available as c_long,
-                        guard.completion_events.as_mut_ptr(),
-                        ptr::null_mut::<timespec>(),
-                    );
+        assert!(available == 1);
 
-                    // adjust the vector size to the actual number of items returned
-                    if result >= 0 {
-                        guard.completion_events.set_len(result as usize);
-                    } else {
-                        return Err(io::Error::last_os_error());
-                    }
-                };
+        // get completion events; we retrieve exactly the number indiceted in the 
+        // eventfd read-out.
+        let mut event: io_event = unsafe { mem::zeroed() };
 
-                for ref event in guard.completion_events.iter() {
-                    let future: &mut AioBaseFuture = unsafe { mem::transmute(event.data) };
-                    let result = event.res;
+        unsafe {
+            let result = io_getevents(
+                self.context.context,
+                1 as c_long,
+                1 as c_long,
+                &mut event,
+                ptr::null_mut::<timespec>(),
+            );
 
-                    future.result = if result < 0 {
-                        Some(Err(io::Error::from_raw_os_error(result as i32)))
-                    } else {
-                        Some(Ok(()))
-                    };
-                }
+            // adjust the vector size to the actual number of items returned
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-                // Release the kernel queue slots we just processed
-                let length = guard.completion_events.len() as u64;
-                if let Err(err) = guard.event.add(length) {
-                    return Err(err);
-                }
-            },
-            Err(_) => panic!("TODO: Figure out how to handle this error"),
-        }
+            assert!(result == 1);
+        };
 
-        if let Some(result) = self.result.take() {
-            // procesing has completed
-            result.map(|_| futures::Async::Ready(()))
+        self.result = if event.res < 0 {
+            Some(Err(io::Error::from_raw_os_error(event.res as i32)))
         } else {
-            // otherwise, register this future on the completion fd and return not ready
-            let mut guard = self.context.completed.write().unwrap();
+            Some(Ok(()))
+        };
 
-            guard.event.evented
-                .need_read()
-                .map(|_| futures::Async::NotReady)
+        // Release the kernel queue slots we just processed
+        match self.context.capacity.write() {
+            Ok(ref mut guard) => {
+                guard.state.push(self.state.take().unwrap());
+                guard.available.add(1)?;
+            },
+            Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
         }
+            
+        Ok(futures::Async::Ready(()))
     }
 }
 
@@ -245,22 +246,6 @@ where
     buffer: ReadWriteHandle,
 }
 
-impl<ReadWriteHandle> IocbSetup for AioReadResultFuture<ReadWriteHandle>
-where
-    ReadWriteHandle: ops::DerefMut<Target = [u8]>,
-{
-    fn setup(&mut self) {
-        unsafe {
-            if self.base.request.aio_data == 0 {
-                self.base.request.aio_data = mem::transmute(&mut self.base);
-                self.base.request.aio_buf = mem::transmute(self.buffer.as_ptr());
-            } else if self.base.request.aio_data != mem::transmute(&mut self.base) {
-                panic!("Future was moved during I/O operation");
-            }
-        }
-    }
-}
-
 impl<ReadWriteHandle> futures::Future for AioReadResultFuture<ReadWriteHandle>
 where
     ReadWriteHandle: ops::DerefMut<Target = [u8]>,
@@ -269,7 +254,6 @@ where
     type Error = io::Error;
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
-        self.setup();
         self.base.poll()
     }
 }
@@ -286,22 +270,6 @@ where
     buffer: ReadOnlyHandle,
 }
 
-impl<ReadOnlyHandle> IocbSetup for AioWriteResultFuture<ReadOnlyHandle>
-where
-    ReadOnlyHandle: ops::Deref<Target = [u8]>,
-{
-    fn setup(&mut self) {
-        unsafe {
-            if self.base.request.aio_data == 0 {
-                self.base.request.aio_data = mem::transmute(&mut self.base);
-                self.base.request.aio_buf = mem::transmute(self.buffer.as_ptr());
-            } else if self.base.request.aio_data != mem::transmute(&mut self.base) {
-                panic!("Future was moved during I/O operation");
-            }
-        }
-    }
-}
-
 impl<ReadOnlyHandle> futures::Future for AioWriteResultFuture<ReadOnlyHandle>
 where
     ReadOnlyHandle: ops::Deref<Target = [u8]>,
@@ -310,25 +278,40 @@ where
     type Error = io::Error;
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
-        self.setup();
         self.base.poll()
     }
 }
 
-struct CompletionState {
-    // event fd indicating that I/O requests have been completed
-    event: eventfd::EventFd,
-
-    // vector of IO completion events; retrieved via io_getevents
-    completion_events: Vec<io_event>,
+struct RequestState {
+    eventfd: eventfd::EventFd,
+    request: iocb,
 }
 
-impl CompletionState {
-    fn new(nr: usize) -> Result<CompletionState, io::Error> {
-        Ok(CompletionState {
-            event: eventfd::EventFd::create(0, false)?,
-            completion_events: Vec::with_capacity(nr),
+struct Capacity {
+    // event fd to signal that we can accept more I/O requests
+    available: eventfd::EventFd,
 
+    // pre-allocated eventfds and iocbs that are associated with scheduled I/O requests
+    state: Vec<Box<RequestState>>,
+}
+
+impl Capacity {
+    fn new(nr: usize) -> Result<Capacity, io::Error> {
+        let available = eventfd::EventFd::create(nr, true)?;
+
+        let mut state = Vec::with_capacity(nr);
+
+        // using a for loop to properly handle the error case
+        // range map collect would only allow for using unwrap(), thereby turning an error into a panic
+        for _ in 0 .. nr {
+            state.push(Box::new(RequestState {
+                eventfd: eventfd::EventFd::create(0, false)?,
+                request: unsafe { mem::zeroed() } }));
+        }
+        
+        Ok(Capacity {
+            available,
+            state,
         })
     }
 }
@@ -337,11 +320,8 @@ struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
 
-    // event fd to signal that we can accept more I/O requests
-    capacity: sync::RwLock<eventfd::EventFd>,
-
-    // state to process completed I/O events
-    completed: sync::RwLock<CompletionState>
+    // pre-allocated eventfds and a capacity semaphore 
+    capacity: sync::RwLock<Capacity>,
 }
 
 impl AioContextInner {
@@ -356,8 +336,7 @@ impl AioContextInner {
 
         Ok(AioContextInner {
             context,
-            capacity: sync::RwLock::new(eventfd::EventFd::create(nr, true)?),
-            completed: sync::RwLock::new(CompletionState::new(nr)?),
+            capacity: sync::RwLock::new(Capacity::new(nr)?),
         })
     }
 }
@@ -405,8 +384,13 @@ impl AioContext {
         AioReadResultFuture {
             base: AioBaseFuture {
                 context: self.inner.clone(),
-                request: self.init_iocb(IOCB_CMD_PREAD, fd, offset, len),
+                opcode: IOCB_CMD_PREAD,
+                fd,
+                offset,
+                len,
+                buf: unsafe { mem::transmute(buffer.as_ptr()) },
                 submitted: false,
+                state: None,
                 result: None,
             },
             buffer,
@@ -432,28 +416,17 @@ impl AioContext {
         AioWriteResultFuture {
             base: AioBaseFuture {
                 context: self.inner.clone(),
-                request: self.init_iocb(IOCB_CMD_PWRITE, fd, offset, len),
+                opcode: IOCB_CMD_PWRITE,
+                fd,
+                offset,
+                len,
+                buf: unsafe { mem::transmute(buffer.as_ptr()) },
                 submitted: false,
+                state: None,
                 result: None,
             },
             buffer,
         }
-    }
-
-    fn init_iocb(&self, opcode: u32, fd: RawFd, offset: u64, len: u64) -> iocb {
-        let mut result: iocb = unsafe { mem::zeroed() };
-
-        result.aio_fildes = fd as u32;
-        result.aio_offset = offset as i64;
-        result.aio_nbytes = len;
-        result.aio_lio_opcode = opcode as u16;
-        result.aio_flags = IOCB_FLAG_RESFD;
-
-        let guard = self.inner.completed.read().unwrap();
-
-        result.aio_resfd = guard.event.evented.get_ref().fd as u32;
-
-        result
     }
 }
 
@@ -604,7 +577,7 @@ mod tests {
             });
             let fd = owned_fd.fd;
 
-            let pool = futures_cpupool::CpuPool::new(4);
+            let pool = futures_cpupool::CpuPool::new(3);
 
             {
                 let context = AioContext::new(10).unwrap();
