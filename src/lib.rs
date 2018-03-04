@@ -30,8 +30,6 @@ extern crate tokio;
 extern crate futures_cpupool;
 extern crate memmap;
 
-use std::cell;
-use std::error;
 use std::io;
 use std::mem;
 use std::ops;
@@ -40,7 +38,7 @@ use std::sync;
 
 use std::os::unix::io::RawFd;
 
-use libc::{c_int, c_long, c_void, mlock};
+use libc::{c_long, c_void, mlock};
 
 use futures::Future;
 use ops::Deref;
@@ -136,6 +134,7 @@ struct AioBaseFuture {
     state: Option<Box<RequestState>>,
 }
 
+// Common future base type for all asynchronous operations supperted by this API
 impl AioBaseFuture {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
         let invalid = -13579;
@@ -162,10 +161,11 @@ impl AioBaseFuture {
                 }
             }
 
+            // Fill in the iocb data structure to be submitted to the kernel
             {
                 assert!(self.state.is_some());
                 let state = self.state.as_mut().unwrap();
-                let state_addr = state.deref().deref() as *const RequestState; 
+                let state_addr = state.deref().deref() as *const RequestState;
                 state.request.aio_data = unsafe { mem::transmute(state_addr) };
                 state.request.aio_resfd = self.context.completed_fd as u32;
                 state.request.aio_flags = IOCB_FLAG_RESFD;
@@ -210,7 +210,7 @@ impl AioBaseFuture {
                 return Ok(futures::Async::NotReady);
             }
 
-            // Release the kernel queue slots we just processed
+            // Release the kernel queue slot and the state variable that we just processed
             match self.context.capacity.write() {
                 Ok(ref mut guard) => {
                     guard.state.push(self.state.take().unwrap());
@@ -278,12 +278,19 @@ where
     }
 }
 
+// State information that is associated with an I/O request that is currently in flight.
 struct RequestState {
+    // Linux kernal I/O control block which can be submitted to io_submit
     request: iocb,
+
+    // Concurrency primitive to notify completion to the associated future
     completed: futures::task::AtomicTask,
-    result: c_long
+
+    // the result value of the I/O request
+    result: c_long,
 }
 
+// Shared state within AioContext that is backing I/O requests as represented by the individual futures.
 struct Capacity {
     // event fd to signal that we can accept more I/O requests
     available: eventfd::EventFd,
@@ -304,7 +311,7 @@ impl Capacity {
             state.push(Box::new(RequestState {
                 request: unsafe { mem::zeroed() },
                 completed: futures::task::AtomicTask::new(),
-                result: 0
+                result: 0,
             }));
         }
 
@@ -312,6 +319,8 @@ impl Capacity {
     }
 }
 
+// The inner state, which is shared between the AioContext object returned to clients and
+// used internally by futues in flight.
 struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
@@ -361,9 +370,12 @@ impl AioContext {
     /// Create a new AioContext that is driven by the provided event loop.
     ///
     /// # Params
+    /// - executor: The executor used to spawn the background polling task
     /// - nr: Number of submission slots fro IO requests
-    pub fn new<E>(executor: &E, nr: usize) -> Result<AioContext, io::Error> 
-        where E: futures::future::Executor<futures::sync::oneshot::Execute<AioPollFuture>> {
+    pub fn new<E>(executor: &E, nr: usize) -> Result<AioContext, io::Error>
+    where
+        E: futures::future::Executor<futures::sync::oneshot::Execute<AioPollFuture>>,
+    {
         let eventfd = eventfd::EventFd::create(0, false)?;
         let fd = eventfd.evented.get_ref().fd;
 
@@ -386,6 +398,11 @@ impl AioContext {
     /// data from the provided absolute file offset into the buffer. The buffer also determines
     /// the number of bytes to be read, which should be a multiple of the underlying device block
     /// size.
+    ///
+    /// # Params:
+    /// - fd: The file descriptor of the file from which to read
+    /// - offset: The file offset where we want to read from
+    /// - buffer: A buffer to receive the read results
     pub fn read<ReadWriteHandle>(
         &self,
         fd: RawFd,
@@ -417,6 +434,11 @@ impl AioContext {
     /// data to the provided absolute file offset from the buffer. The buffer also determines
     /// the number of bytes to be written, which should be a multiple of the underlying device block
     /// size.
+    ///
+    /// # Params:
+    /// - fd: The file descriptor of the file to which to write
+    /// - offset: The file offset where we want to write to
+    /// - buffer: A buffer holding the data to be written
     pub fn write<ReadOnlyHandle>(
         &self,
         fd: RawFd,
@@ -445,12 +467,16 @@ impl AioContext {
     }
 }
 
+// A future spawned as background task to retrieve I/O completion events from the kernel
+// and distributing the results to the current futures in flight.
 struct AioPollFuture {
     // the context handle for retrieving AIO completions from the kernel
     context: aio_context_t,
 
+    // the eventfd on which the kernel will notify I/O completions
     eventfd: eventfd::EventFd,
 
+    // a buffer to retrieve completion status from the kernel
     events: Vec<io_event>,
 }
 
@@ -489,8 +515,7 @@ impl futures::Future for AioPollFuture {
             };
 
             for ref event in &self.events {
-                let request_state: &mut RequestState =
-                    unsafe { mem::transmute(event.data) };
+                let request_state: &mut RequestState = unsafe { mem::transmute(event.data) };
 
                 request_state.result = event.res;
                 request_state.completed.notify();
@@ -498,6 +523,10 @@ impl futures::Future for AioPollFuture {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test code starts here
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -563,7 +592,7 @@ mod tests {
 
             MemoryBlock {
                 // for real uses, we'll have a buffer pool with locks associated with individual pages
-                // simplifying the logic here for test case development                
+                // simplifying the logic here for test case development
                 bytes: sync::RwLock::new(map),
             }
         }
@@ -603,7 +632,7 @@ mod tests {
         }
     }
 
-/*
+    /*
     #[test]
     fn read_block() {
         let file_name = temp_file_name();
@@ -660,9 +689,9 @@ mod tests {
                 let context = AioContext::new(&pool, 10).unwrap();
                 let read_future = context
                     .read(fd, 0, buffer)
-                    .map(move |_| { 
-                        //std::thread::sleep_ms(1000);
-                        assert!(validate_block(&result_buffer)); } )
+                    .map(move |_| {
+                        assert!(validate_block(&result_buffer));
+                    })
                     .map_err(|err| {
                         panic!("{:?}", err);
                     });
@@ -675,6 +704,33 @@ mod tests {
         }
 
         remove_file(&file_name);
+    }
+
+    #[test]
+    fn read_invalid_fd() {
+        let fd = 2431;
+
+        let pool = futures_cpupool::CpuPool::new(5);
+        let buffer = MemoryHandle::new();
+        let result_buffer = buffer.clone();
+
+        {
+            let context = AioContext::new(&pool, 10).unwrap();
+            let read_future = context
+                .read(fd, 0, buffer)
+                .map(move |_| {
+                    assert!(false);
+                })
+                .map_err(|err| {
+                    assert!(err.kind() == io::ErrorKind::Other);
+                    err
+                });
+
+            let cpu_future = pool.spawn(read_future);
+            let result = cpu_future.wait();
+
+            assert!(result.is_err());
+        }
     }
 
     fn validate_block(data: &[u8]) -> bool {
