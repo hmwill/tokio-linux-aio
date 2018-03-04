@@ -43,6 +43,7 @@ use std::os::unix::io::RawFd;
 use libc::{c_int, c_long};
 
 use futures::Future;
+use ops::Deref;
 
 // Relevant symbols from the native bindings exposed via aio-bindings
 use aio_bindings::{aio_context_t, io_event, iocb, syscall, timespec, __NR_io_destroy,
@@ -133,25 +134,13 @@ struct AioBaseFuture {
 
     // the associated eventfd
     state: Option<Box<RequestState>>,
-
-    // AtomicTask object that is notified when the I/O operation completes
-    completed: futures::task::AtomicTask,
-
-    // place to capture the result of the I/O operation
-    result: Option<Result<(), io::Error>>,
 }
 
 impl AioBaseFuture {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
-        if let Some(result) = self.result.take() {
-            // procesing has completed
-            return result.map(|_| futures::Async::Ready(()));
-        }
-
         if !self.submitted {
             // See if we can secure a submission slot
             if self.state.is_none() {
-                let self_addr = self as *mut AioBaseFuture;
                 let mut guard = self.context.capacity.write();
 
                 match guard {
@@ -164,7 +153,8 @@ impl AioBaseFuture {
                                 self.state = guard.state.pop();
                                 assert!(self.state.is_some());
                                 let state = self.state.as_mut().unwrap();
-                                state.request.aio_data = unsafe { mem::transmute(self_addr) };
+                                let state_addr = state.deref().deref() as *const RequestState; 
+                                state.request.aio_data = unsafe { mem::transmute(state_addr) };
                                 state.request.aio_resfd = self.context.completed_fd as u32;
                                 state.request.aio_flags = IOCB_FLAG_RESFD;
                                 state.request.aio_fildes = self.fd as u32;
@@ -190,17 +180,22 @@ impl AioBaseFuture {
                     &mut request_ptr_array[0] as *mut *mut iocb,
                 )
             };
+
             self.submitted = true;
 
             // if we have submission error, capture it as future result
             if result != 1 {
                 return Err(io::Error::last_os_error());
-            }
+            } else {
+                // register the current task to be notified upon I/O completion
+                self.state.as_mut().unwrap().completed.register();
 
-            // register the current task to be notified upon I/O completion
-            self.completed.register();
-            return Ok(futures::Async::NotReady);
+                // wait to be polled again
+                return Ok(futures::Async::NotReady);
+            }
         }
+
+        let result_code = self.state.as_ref().unwrap().result;
 
         // Release the kernel queue slots we just processed
         match self.context.capacity.write() {
@@ -211,10 +206,11 @@ impl AioBaseFuture {
             Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
         }
 
-        self.result
-            .take()
-            .unwrap()
-            .map(|_| futures::Async::Ready(()))
+        if result_code < 0 {
+            Err(io::Error::from_raw_os_error(result_code as i32))
+        } else {
+            Ok(futures::Async::Ready(()))
+        }
     }
 }
 
@@ -270,6 +266,8 @@ where
 
 struct RequestState {
     request: iocb,
+    completed: futures::task::AtomicTask,
+    result: c_long
 }
 
 struct Capacity {
@@ -291,6 +289,8 @@ impl Capacity {
         for _ in 0..nr {
             state.push(Box::new(RequestState {
                 request: unsafe { mem::zeroed() },
+                completed: futures::task::AtomicTask::new(),
+                result: 0
             }));
         }
 
@@ -307,9 +307,6 @@ struct AioContextInner {
 
     // pre-allocated eventfds and a capacity semaphore
     capacity: sync::RwLock<Capacity>,
-
-    // flag that will be set to terminate the poller task
-    stop_polling: sync::atomic::AtomicBool,
 }
 
 impl AioContextInner {
@@ -326,7 +323,6 @@ impl AioContextInner {
             context,
             capacity: sync::RwLock::new(Capacity::new(nr)?),
             completed_fd: fd,
-            stop_polling: sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -340,8 +336,7 @@ impl Drop for AioContextInner {
 
 pub struct AioContext {
     inner: sync::Arc<AioContextInner>,
-    terminate: Option<futures::sync::oneshot::Sender<()>>,
-    terminate_ack: Option<futures::sync::oneshot::Receiver<()>>,
+    poll_task_handle: futures::sync::oneshot::SpawnHandle<(), io::Error>,
 }
 
 /// AioContext provides a submission queue for asycnronous I/O operations to
@@ -351,10 +346,8 @@ impl AioContext {
     ///
     /// # Params
     /// - nr: Number of submission slots fro IO requests
-    pub fn new<S>(spawn: S, nr: usize) -> Result<AioContext, io::Error>
-    where
-        S: Fn(Box<futures::Future<Item = (), Error = io::Error>>) -> (),
-    {
+    pub fn new<E>(executor: &E, nr: usize) -> Result<AioContext, io::Error> 
+        where E: futures::future::Executor<futures::sync::oneshot::Execute<AioPollFuture>> {
         let eventfd = eventfd::EventFd::create(0, false)?;
         let fd = eventfd.evented.get_ref().fd;
 
@@ -367,25 +360,9 @@ impl AioContext {
             events: Vec::with_capacity(nr),
         };
 
-        let (terminate, receiver) = futures::sync::oneshot::channel::<()>();
-        let (acknowledge, terminate_ack) = futures::sync::oneshot::channel::<()>();
-
-        let termination_future = receiver
-            .map(move |_| {
-                panic!("Got terminate request");
-;                acknowledge.send(()).unwrap();
-            })
-            .map_err(move |cancelled| io::Error::new(io::ErrorKind::ConnectionAborted, cancelled));
-
-        let boxed_future: Box<futures::Future<Item = (), Error = io::Error>> =
-            Box::new(termination_future);
-
-        spawn(boxed_future);
-
         Ok(AioContext {
             inner: sync::Arc::new(inner),
-            terminate: Some(terminate),
-            terminate_ack: Some(terminate_ack),
+            poll_task_handle: futures::sync::oneshot::spawn(poll_future, executor),
         })
     }
 
@@ -415,8 +392,6 @@ impl AioContext {
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
                 submitted: false,
                 state: None,
-                completed: futures::task::AtomicTask::new(),
-                result: None,
             },
             buffer,
         }
@@ -448,18 +423,9 @@ impl AioContext {
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
                 submitted: false,
                 state: None,
-                completed: futures::task::AtomicTask::new(),
-                result: None,
             },
             buffer,
         }
-    }
-}
-
-impl Drop for AioContext {
-    fn drop(&mut self) {
-        self.terminate.take().unwrap().send(());
-        self.terminate_ack.take().unwrap().wait().unwrap();
     }
 }
 
@@ -506,17 +472,11 @@ impl futures::Future for AioPollFuture {
             };
 
             for ref event in &self.events {
-                let request_future: &mut AioBaseFuture =
-                    unsafe { mem::transmute(event.data as *mut AioBaseFuture) };
+                let request_state: &mut RequestState =
+                    unsafe { mem::transmute(event.data) };
 
-                // this is the result of the I/O request
-                request_future.result = if event.res < 0 {
-                    Some(Err(io::Error::from_raw_os_error(event.res as i32)))
-                } else {
-                    Some(Ok(()))
-                };
-
-                request_future.completed.notify();
+                request_state.result = event.res;
+                request_state.completed.notify();
             }
         }
     }
@@ -571,10 +531,9 @@ mod tests {
 
     #[test]
     fn create_and_drop() {
-        current_thread::run(move |_| {
-            let context =
-                AioContext::new(|f| current_thread::spawn(f.map_err(|_| ())), 10).unwrap();
-        });
+        let pool = futures_cpupool::CpuPool::new(3);
+        let mut context =
+            AioContext::new(&pool, 10).unwrap();
     }
 
     struct MemoryBlock {
@@ -660,7 +619,6 @@ mod tests {
     }
 */
 
-    /*
     #[test]
     fn read_block_mt() {
         let file_name = temp_file_name();
@@ -675,10 +633,10 @@ mod tests {
             });
             let fd = owned_fd.fd;
 
-            let pool = futures_cpupool::CpuPool::new(3);
+            let pool = futures_cpupool::CpuPool::new(5);
 
             {
-                let context = AioContext::new(|f| pool.spawn(f.map_err(|_| {})).wait().unwrap(), 10).unwrap();
+                let context = AioContext::new(&pool, 10).unwrap();
                 let buffer = MemoryHandle::new();
                 let result_buffer = buffer.clone();
                 let read_future = context
@@ -697,7 +655,6 @@ mod tests {
 
         remove_file(&file_name);
     }
-*/
 
     fn validate_block(data: &[u8]) -> bool {
         for index in 0..data.len() {
