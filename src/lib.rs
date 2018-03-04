@@ -30,6 +30,7 @@ extern crate tokio;
 extern crate futures_cpupool;
 extern crate memmap;
 
+use std::collections;
 use std::io;
 use std::mem;
 use std::ops;
@@ -101,6 +102,80 @@ unsafe fn io_getevents(
 }
 
 // -----------------------------------------------------------------------------------------------
+// Semaphore that's workable with Futures
+// -----------------------------------------------------------------------------------------------
+
+struct SemaphoreInner {
+    capacity: usize,
+    waiters: collections::VecDeque<futures::sync::oneshot::Sender<()>>,
+}
+
+struct Semaphore {
+    inner: sync::Arc<sync::RwLock<SemaphoreInner>>,
+}
+
+impl Semaphore {
+    fn new(initial: usize) -> Semaphore {
+        Semaphore {
+            inner: sync::Arc::new(sync::RwLock::new(SemaphoreInner {
+                capacity: initial,
+                waiters: collections::VecDeque::new(),
+            })),
+        }
+    }
+
+    fn acquire(&self) -> SemaphoreHandle {
+        let mut lock_result = self.inner.write();
+
+        match lock_result {
+            Ok(ref mut guard) => {
+                if guard.capacity > 0 {
+                    guard.capacity -= 1;
+                    SemaphoreHandle::Completed(futures::future::result(Ok(())))
+                } else {
+                    let (sender, receiver) = futures::sync::oneshot::channel();
+                    guard.waiters.push_back(sender);
+                    SemaphoreHandle::Waiting(receiver)
+                }
+            },
+            Err(err) => panic!("Lock failure {:?}", err)
+        }
+    }
+
+    fn release(&self) {
+        let mut lock_result = self.inner.write();
+
+        match lock_result {
+            Ok(ref mut guard) => {
+                if !guard.waiters.is_empty() {
+                    guard.waiters.pop_front().unwrap().send(()).unwrap();
+                } else {
+                    guard.capacity += 1;
+                }
+            },
+            Err(err) => panic!("Lock failure {:?}", err)
+        }
+    }
+}
+
+enum SemaphoreHandle {
+    Waiting(futures::sync::oneshot::Receiver<()>),
+    Completed(futures::future::FutureResult<(), io::Error>)
+}
+
+impl futures::Future for SemaphoreHandle {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
+        match self {
+            &mut SemaphoreHandle::Completed(_) => Ok(futures::Async::Ready(())),
+            &mut SemaphoreHandle::Waiting(ref mut receiver) => receiver.poll().map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
 // Bindings for Linux AIO start here
 // -----------------------------------------------------------------------------------------------
 
@@ -130,8 +205,11 @@ struct AioBaseFuture {
     // to the kernel.
     submitted: sync::atomic::AtomicBool,
 
-    // the associated eventfd
+    // the associated request state
     state: Option<Box<RequestState>>,
+
+    // acquire future
+    acquire_state: Option<SemaphoreHandle>,
 }
 
 // Common future base type for all asynchronous operations supperted by this API
@@ -141,23 +219,25 @@ impl AioBaseFuture {
 
         if !self.submitted.load(sync::atomic::Ordering::Acquire) {
             // See if we can secure a submission slot
-            if self.state.is_none() {
-                let mut guard = self.context.capacity.write();
 
-                match guard {
-                    Ok(ref mut guard) => {
-                        match guard.available.read() {
-                            Err(err) => return Err(err),
-                            Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                            Ok(futures::Async::Ready(n)) => {
-                                assert!(n == 1);
+            assert!(self.state.is_none());
 
-                                // retrieve an eventfd from the set of available ones and move it into the future
-                                self.state = guard.state.pop();
-                            }
+            if self.acquire_state.is_none() {
+                self.acquire_state = Some(self.context.have_capacity.acquire());
+            }
+            
+            match self.acquire_state.as_mut().unwrap().poll() {
+                Err(err) => return Err(err),
+                Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+                Ok(futures::Async::Ready(_)) => {
+                    // retrieve a state container from the set of available ones and move it into the future
+                    let mut guard = self.context.capacity.write();
+                    match guard {
+                        Ok(ref mut guard) => {
+                            self.state = guard.state.pop();
                         }
+                        Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
                     }
-                    Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
                 }
             }
 
@@ -207,17 +287,19 @@ impl AioBaseFuture {
 
             // triggered in error?
             if result_code == invalid {
-                return Ok(futures::Async::NotReady);
+                panic!("Does this still happen?");
             }
 
             // Release the kernel queue slot and the state variable that we just processed
             match self.context.capacity.write() {
                 Ok(ref mut guard) => {
                     guard.state.push(self.state.take().unwrap());
-                    guard.available.add(1)?;
                 }
                 Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
             }
+
+            // notify others that we release a state slot
+            self.context.have_capacity.release();
 
             if result_code < 0 {
                 Err(io::Error::from_raw_os_error(result_code as i32))
@@ -292,17 +374,12 @@ struct RequestState {
 
 // Shared state within AioContext that is backing I/O requests as represented by the individual futures.
 struct Capacity {
-    // event fd to signal that we can accept more I/O requests
-    available: eventfd::EventFd,
-
     // pre-allocated eventfds and iocbs that are associated with scheduled I/O requests
     state: Vec<Box<RequestState>>,
 }
 
 impl Capacity {
     fn new(nr: usize) -> Result<Capacity, io::Error> {
-        let available = eventfd::EventFd::create(nr, true)?;
-
         let mut state = Vec::with_capacity(nr);
 
         // using a for loop to properly handle the error case
@@ -315,7 +392,7 @@ impl Capacity {
             }));
         }
 
-        Ok(Capacity { available, state })
+        Ok(Capacity { state })
     }
 }
 
@@ -329,6 +406,9 @@ struct AioContextInner {
     // the handle is managed by the Eventfd object that is owned by the AioPollFuture
     // that we spawn when creating an AioContext.
     completed_fd: RawFd,
+
+    // do we have capacity?
+    have_capacity: Semaphore,
 
     // pre-allocated eventfds and a capacity semaphore
     capacity: sync::RwLock<Capacity>,
@@ -347,6 +427,7 @@ impl AioContextInner {
         Ok(AioContextInner {
             context,
             capacity: sync::RwLock::new(Capacity::new(nr)?),
+            have_capacity: Semaphore::new(nr),
             completed_fd: fd,
         })
     }
@@ -371,11 +452,12 @@ impl AioContext {
     ///
     /// # Params
     /// - executor: The executor used to spawn the background polling task
-    /// - nr: Number of submission slots fro IO requests
+    /// - nr: Number of submission slots for IO requests
     pub fn new<E>(executor: &E, nr: usize) -> Result<AioContext, io::Error>
     where
         E: futures::future::Executor<futures::sync::oneshot::Execute<AioPollFuture>>,
     {
+        // An eventfd that we use for I/O completion notifications from the kernel
         let eventfd = eventfd::EventFd::create(0, false)?;
         let fd = eventfd.evented.get_ref().fd;
 
@@ -425,6 +507,7 @@ impl AioContext {
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
                 submitted: sync::atomic::AtomicBool::new(false),
                 state: None,
+                acquire_state: None,
             },
             buffer,
         }
@@ -461,6 +544,7 @@ impl AioContext {
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
                 submitted: sync::atomic::AtomicBool::new(false),
                 state: None,
+                acquire_state: None,
             },
             buffer,
         }
@@ -469,7 +553,7 @@ impl AioContext {
 
 // A future spawned as background task to retrieve I/O completion events from the kernel
 // and distributing the results to the current futures in flight.
-struct AioPollFuture {
+pub struct AioPollFuture {
     // the context handle for retrieving AIO completions from the kernel
     context: aio_context_t,
 
@@ -560,7 +644,7 @@ mod tests {
     // Create a temporary file with some content
     fn create_temp_file(path: &path::Path) {
         let mut file = fs::File::create(path).unwrap();
-        let mut data: [u8; 16384] = [0; 16384];
+        let mut data: [u8; 65536] = [0; 65536];
 
         for index in 0..data.len() {
             data[index] = index as u8;
@@ -632,41 +716,6 @@ mod tests {
         }
     }
 
-    /*
-    #[test]
-    fn read_block() {
-        let file_name = temp_file_name();
-        create_temp_file(&file_name);
-
-        {
-            let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
-                open(
-                    mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
-                    O_DIRECT | O_RDWR,
-                )
-            });
-            let fd = owned_fd.fd;
-
-            current_thread::run(move |_| {
-                let context =
-                    AioContext::new(|f| current_thread::spawn(f.map_err(|_| ())), 10).unwrap();
-                let buffer = MemoryHandle::new();
-                let result_buffer = buffer.clone();
-                let read_future = context
-                    .read(fd, 0, buffer)
-                    .map(move |_| assert!(validate_block(&result_buffer)))
-                    .map_err(|err| {
-                        panic!("{:?}", err);
-                    });
-
-                current_thread::spawn(read_future);
-            });
-        }
-
-        remove_file(&file_name);
-    }
-*/
-
     #[test]
     fn read_block_mt() {
         let file_name = temp_file_name();
@@ -731,6 +780,57 @@ mod tests {
 
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn read_many_blocks_mt() {
+        let file_name = temp_file_name();
+        create_temp_file(&file_name);
+
+        {
+            let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
+                open(
+                    mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
+                    O_DIRECT | O_RDWR,
+                )
+            });
+            let fd = owned_fd.fd;
+
+            let pool = futures_cpupool::CpuPool::new(5);
+
+            {
+                let context = AioContext::new(&pool, 10).unwrap();
+
+                // 5 waves of requests just going above the lmit
+
+                // Wave 1
+                for _wave in 0..5 {
+                    let mut futures = Vec::new();
+
+                    for index in 0..50 {
+                        let buffer = MemoryHandle::new();
+                        let result_buffer = buffer.clone();
+                        let read_future = context
+                            .read(fd, (index * 8192) % 65536, buffer)
+                            .map(move |_| {
+                                assert!(validate_block(&result_buffer));
+                            })
+                            .map_err(|err| {
+                                panic!("{:?}", err);
+                            });
+
+                        futures.push(pool.spawn(read_future));
+                    }
+
+                    // wait for all 50 requests to complete
+                    let result = futures::future::join_all(futures).wait();
+
+                    assert!(result.is_ok());
+                }
+            }
+        }
+
+        remove_file(&file_name);
     }
 
     fn validate_block(data: &[u8]) -> bool {
