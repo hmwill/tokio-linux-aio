@@ -137,8 +137,8 @@ impl Semaphore {
                     guard.waiters.push_back(sender);
                     SemaphoreHandle::Waiting(receiver)
                 }
-            },
-            Err(err) => panic!("Lock failure {:?}", err)
+            }
+            Err(err) => panic!("Lock failure {:?}", err),
         }
     }
 
@@ -152,15 +152,15 @@ impl Semaphore {
                 } else {
                     guard.capacity += 1;
                 }
-            },
-            Err(err) => panic!("Lock failure {:?}", err)
+            }
+            Err(err) => panic!("Lock failure {:?}", err),
         }
     }
 }
 
 enum SemaphoreHandle {
     Waiting(futures::sync::oneshot::Receiver<()>),
-    Completed(futures::future::FutureResult<(), io::Error>)
+    Completed(futures::future::FutureResult<(), io::Error>),
 }
 
 impl futures::Future for SemaphoreHandle {
@@ -170,7 +170,9 @@ impl futures::Future for SemaphoreHandle {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
         match self {
             &mut SemaphoreHandle::Completed(_) => Ok(futures::Async::Ready(())),
-            &mut SemaphoreHandle::Waiting(ref mut receiver) => receiver.poll().map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+            &mut SemaphoreHandle::Waiting(ref mut receiver) => receiver
+                .poll()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err)),
         }
     }
 }
@@ -225,7 +227,7 @@ impl AioBaseFuture {
             if self.acquire_state.is_none() {
                 self.acquire_state = Some(self.context.have_capacity.acquire());
             }
-            
+
             match self.acquire_state.as_mut().unwrap().poll() {
                 Err(err) => return Err(err),
                 Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
@@ -288,6 +290,10 @@ impl AioBaseFuture {
             // triggered in error?
             if result_code == invalid {
                 panic!("Does this still happen?");
+                // Make sure we get another chance?
+                self.state.as_mut().unwrap().completed.register();
+                
+                return Ok(futures::Async::NotReady);
             }
 
             // Release the kernel queue slot and the state variable that we just processed
@@ -632,6 +638,8 @@ mod tests {
 
     use libc::{close, open, O_DIRECT, O_RDWR};
 
+    const FILE_SIZE: u64 = 1024 * 512;
+
     // Create a temporary file name within the temporary directory configured in the environment.
     fn temp_file_name() -> path::PathBuf {
         let mut rng = rand::thread_rng();
@@ -644,7 +652,7 @@ mod tests {
     // Create a temporary file with some content
     fn create_temp_file(path: &path::Path) {
         let mut file = fs::File::create(path).unwrap();
-        let mut data: [u8; 65536] = [0; 65536];
+        let mut data: [u8; FILE_SIZE as usize] = [0; FILE_SIZE as usize];
 
         for index in 0..data.len() {
             data[index] = index as u8;
@@ -796,10 +804,10 @@ mod tests {
             });
             let fd = owned_fd.fd;
 
-            let pool = futures_cpupool::CpuPool::new(5);
+            let pool = futures_cpupool::CpuPool::new(2);
 
             {
-                let context = AioContext::new(&pool, 10).unwrap();
+                let context = AioContext::new(&pool, 7).unwrap();
 
                 // 5 waves of requests just going above the lmit
 
@@ -807,11 +815,11 @@ mod tests {
                 for _wave in 0..5 {
                     let mut futures = Vec::new();
 
-                    for index in 0..50 {
+                    for index in 0..100 {
                         let buffer = MemoryHandle::new();
                         let result_buffer = buffer.clone();
                         let read_future = context
-                            .read(fd, (index * 8192) % 65536, buffer)
+                            .read(fd, (index * 8192) % FILE_SIZE, buffer)
                             .map(move |_| {
                                 assert!(validate_block(&result_buffer));
                             })
