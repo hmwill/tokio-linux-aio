@@ -40,7 +40,7 @@ use std::sync;
 
 use std::os::unix::io::RawFd;
 
-use libc::{c_int, c_long};
+use libc::{c_int, c_long, c_void, mlock};
 
 use futures::Future;
 use ops::Deref;
@@ -130,7 +130,7 @@ struct AioBaseFuture {
 
     // state variable tracking if the I/O request associated with this instance has been submitted
     // to the kernel.
-    submitted: bool,
+    submitted: sync::atomic::AtomicBool,
 
     // the associated eventfd
     state: Option<Box<RequestState>>,
@@ -138,7 +138,9 @@ struct AioBaseFuture {
 
 impl AioBaseFuture {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
-        if !self.submitted {
+        let invalid = -13579;
+
+        if !self.submitted.load(sync::atomic::Ordering::Acquire) {
             // See if we can secure a submission slot
             if self.state.is_none() {
                 let mut guard = self.context.capacity.write();
@@ -148,25 +150,31 @@ impl AioBaseFuture {
                         match guard.available.read() {
                             Err(err) => return Err(err),
                             Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                            Ok(futures::Async::Ready(_)) => {
+                            Ok(futures::Async::Ready(n)) => {
+                                assert!(n == 1);
+
                                 // retrieve an eventfd from the set of available ones and move it into the future
                                 self.state = guard.state.pop();
-                                assert!(self.state.is_some());
-                                let state = self.state.as_mut().unwrap();
-                                let state_addr = state.deref().deref() as *const RequestState; 
-                                state.request.aio_data = unsafe { mem::transmute(state_addr) };
-                                state.request.aio_resfd = self.context.completed_fd as u32;
-                                state.request.aio_flags = IOCB_FLAG_RESFD;
-                                state.request.aio_fildes = self.fd as u32;
-                                state.request.aio_offset = self.offset as i64;
-                                state.request.aio_buf = self.buf;
-                                state.request.aio_nbytes = self.len;
-                                state.request.aio_lio_opcode = self.opcode as u16;
                             }
                         }
                     }
                     Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
                 }
+            }
+
+            {
+                assert!(self.state.is_some());
+                let state = self.state.as_mut().unwrap();
+                let state_addr = state.deref().deref() as *const RequestState; 
+                state.request.aio_data = unsafe { mem::transmute(state_addr) };
+                state.request.aio_resfd = self.context.completed_fd as u32;
+                state.request.aio_flags = IOCB_FLAG_RESFD;
+                state.request.aio_fildes = self.fd as u32;
+                state.request.aio_offset = self.offset as i64;
+                state.request.aio_buf = self.buf;
+                state.request.aio_nbytes = self.len;
+                state.request.aio_lio_opcode = self.opcode as u16;
+                state.result = invalid;
             }
 
             // submit the request
@@ -181,7 +189,8 @@ impl AioBaseFuture {
                 )
             };
 
-            self.submitted = true;
+            // mark that we performed the submission
+            self.submitted.store(true, sync::atomic::Ordering::Release);
 
             // if we have submission error, capture it as future result
             if result != 1 {
@@ -193,23 +202,28 @@ impl AioBaseFuture {
                 // wait to be polled again
                 return Ok(futures::Async::NotReady);
             }
-        }
-
-        let result_code = self.state.as_ref().unwrap().result;
-
-        // Release the kernel queue slots we just processed
-        match self.context.capacity.write() {
-            Ok(ref mut guard) => {
-                guard.state.push(self.state.take().unwrap());
-                guard.available.add(1)?;
-            }
-            Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
-        }
-
-        if result_code < 0 {
-            Err(io::Error::from_raw_os_error(result_code as i32))
         } else {
-            Ok(futures::Async::Ready(()))
+            let result_code = self.state.as_ref().unwrap().result;
+
+            // triggered in error?
+            if result_code == invalid {
+                return Ok(futures::Async::NotReady);
+            }
+
+            // Release the kernel queue slots we just processed
+            match self.context.capacity.write() {
+                Ok(ref mut guard) => {
+                    guard.state.push(self.state.take().unwrap());
+                    guard.available.add(1)?;
+                }
+                Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
+            }
+
+            if result_code < 0 {
+                Err(io::Error::from_raw_os_error(result_code as i32))
+            } else {
+                Ok(futures::Async::Ready(()))
+            }
         }
     }
 }
@@ -302,7 +316,9 @@ struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio_context_t,
 
-    // the fd embedded in the completed eventfd, which can be passed to kernel functions
+    // the fd embedded in the completed eventfd, which can be passed to kernel functions;
+    // the handle is managed by the Eventfd object that is owned by the AioPollFuture
+    // that we spawn when creating an AioContext.
     completed_fd: RawFd,
 
     // pre-allocated eventfds and a capacity semaphore
@@ -390,7 +406,7 @@ impl AioContext {
                 offset,
                 len,
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
-                submitted: false,
+                submitted: sync::atomic::AtomicBool::new(false),
                 state: None,
             },
             buffer,
@@ -421,7 +437,7 @@ impl AioContext {
                 offset,
                 len,
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
-                submitted: false,
+                submitted: sync::atomic::AtomicBool::new(false),
                 state: None,
             },
             buffer,
@@ -451,6 +467,7 @@ impl futures::Future for AioPollFuture {
                 Ok(futures::Async::Ready(value)) => value as usize,
             };
 
+            assert!(available > 0);
             self.events.clear();
 
             unsafe {
@@ -520,7 +537,7 @@ mod tests {
             data[index] = index as u8;
         }
 
-        let result = file.write(&data);
+        let result = file.write(&data).and_then(|_| file.sync_all());
         assert!(result.is_ok());
     }
 
@@ -532,8 +549,7 @@ mod tests {
     #[test]
     fn create_and_drop() {
         let pool = futures_cpupool::CpuPool::new(3);
-        let mut context =
-            AioContext::new(&pool, 10).unwrap();
+        let _context = AioContext::new(&pool, 10).unwrap();
     }
 
     struct MemoryBlock {
@@ -542,10 +558,13 @@ mod tests {
 
     impl MemoryBlock {
         fn new() -> MemoryBlock {
+            let map = memmap::MmapMut::map_anon(8192).unwrap();
+            unsafe { mlock(map.as_ref().as_ptr() as *const c_void, map.len()) };
+
             MemoryBlock {
                 // for real uses, we'll have a buffer pool with locks associated with individual pages
-                // simplifying the logic here for test case development
-                bytes: sync::RwLock::new(memmap::MmapMut::map_anon(8192).unwrap()),
+                // simplifying the logic here for test case development                
+                bytes: sync::RwLock::new(map),
             }
         }
     }
@@ -634,14 +653,16 @@ mod tests {
             let fd = owned_fd.fd;
 
             let pool = futures_cpupool::CpuPool::new(5);
+            let buffer = MemoryHandle::new();
+            let result_buffer = buffer.clone();
 
             {
                 let context = AioContext::new(&pool, 10).unwrap();
-                let buffer = MemoryHandle::new();
-                let result_buffer = buffer.clone();
                 let read_future = context
                     .read(fd, 0, buffer)
-                    .map(move |_| assert!(validate_block(&result_buffer)))
+                    .map(move |_| { 
+                        //std::thread::sleep_ms(1000);
+                        assert!(validate_block(&result_buffer)); } )
                     .map_err(|err| {
                         panic!("{:?}", err);
                     });
