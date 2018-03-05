@@ -22,19 +22,17 @@
 
 extern crate aio_bindings;
 extern crate futures;
+extern crate futures_cpupool;
 extern crate libc;
 extern crate mio;
+extern crate memmap;
 extern crate rand;
 extern crate tokio;
-
-extern crate futures_cpupool;
-extern crate memmap;
 
 use std::io;
 use std::mem;
 use std::ops;
 use std::ptr;
-
 
 use std::os::unix::io::RawFd;
 
@@ -43,6 +41,7 @@ use libc::{c_long, c_void, mlock};
 use futures::Future;
 use ops::Deref;
 
+// local modules
 mod aio;
 mod eventfd;
 mod sync;
@@ -51,13 +50,8 @@ mod sync;
 // Bindings for Linux AIO start here
 // -----------------------------------------------------------------------------------------------
 
-// Common data structures for futures returned by `AioContext`.
-struct AioBaseFuture {
-    // reference to the `AioContext` that controls the submission queue for asynchronous I/O
-    context: std::sync::Arc<AioContextInner>,
-
-    // field values that we need to transfer into the IOCB
-
+// field values that we need to transfer into a kernel IOCB
+struct IocbInfo {
     // the I/O opcode
     opcode: u32,
 
@@ -72,6 +66,27 @@ struct AioBaseFuture {
 
     // the number of bytes to be transferred, if applicable
     len: u64,
+}
+
+// State information that is associated with an I/O request that is currently in flight.
+struct RequestState {
+    // Linux kernal I/O control block which can be submitted to io_submit
+    request: aio::iocb,
+
+    // Concurrency primitive to notify completion to the associated future
+    completed_receiver: futures::sync::oneshot::Receiver<c_long>,
+
+    // We have both sides of a oneshot channel here
+    completed_sender: Option<futures::sync::oneshot::Sender<c_long>>,
+}
+
+// Common data structures for futures returned by `AioContext`.
+struct AioBaseFuture {
+    // reference to the `AioContext` that controls the submission queue for asynchronous I/O
+    context: std::sync::Arc<AioContextInner>,
+
+    // request information captured for the kernel request
+    iocb_info: IocbInfo,
 
     // the associated request state
     state: Option<Box<RequestState>>,
@@ -80,9 +95,10 @@ struct AioBaseFuture {
     acquire_state: Option<sync::SemaphoreHandle>,
 }
 
-// Common future base type for all asynchronous operations supperted by this API
 impl AioBaseFuture {
-    fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
+    // Attempt to submit the I/O request; this may need to wait until a submission slot is
+    // available.
+    fn submit_request(&mut self) -> Result<futures::Async<()>, io::Error> {    
         if self.state.is_none() {
             // See if we can secure a submission slot
             if self.acquire_state.is_none() {
@@ -112,11 +128,11 @@ impl AioBaseFuture {
             state.request.aio_data = unsafe { mem::transmute(state_addr) };
             state.request.aio_resfd = self.context.completed_fd as u32;
             state.request.aio_flags = aio::IOCB_FLAG_RESFD;
-            state.request.aio_fildes = self.fd as u32;
-            state.request.aio_offset = self.offset as i64;
-            state.request.aio_buf = self.buf;
-            state.request.aio_nbytes = self.len;
-            state.request.aio_lio_opcode = self.opcode as u16;
+            state.request.aio_fildes = self.iocb_info.fd as u32;
+            state.request.aio_offset = self.iocb_info.offset as i64;
+            state.request.aio_buf = self.iocb_info.buf;
+            state.request.aio_nbytes = self.iocb_info.len;
+            state.request.aio_lio_opcode = self.iocb_info.opcode as u16;
 
             // attach synchronization primitives that are used to indicate completion of this request
             let (sender, receiver) = futures::sync::oneshot::channel();
@@ -141,6 +157,12 @@ impl AioBaseFuture {
             }
         }
 
+        Ok(futures::Async::Ready(()))
+    }
+
+    // Attempt to retrieve the result of a previously submitted I/O request; this may need to
+    // wait until the I/O operation has been completed
+    fn retrieve_result(&mut self) -> Result<futures::Async<()>, io::Error> {
         // Check if we have received a notification indicating completion of the I/O request
         let result_code = match self.state.as_mut().unwrap().completed_receiver.poll() {
             Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
@@ -163,6 +185,22 @@ impl AioBaseFuture {
             Err(io::Error::from_raw_os_error(result_code as i32))
         } else {
             Ok(futures::Async::Ready(()))
+        }
+    }
+}
+
+// Common future base type for all asynchronous operations supperted by this API
+impl futures::Future for AioBaseFuture {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
+        let result = self.submit_request();
+
+        match result {
+            Ok(futures::Async::Ready(())) => self.retrieve_result(),
+            Ok(futures::Async::NotReady) => Ok(futures::Async::NotReady),
+            Err(err) => Err(err),
         }
     }
 }
@@ -217,16 +255,66 @@ where
     }
 }
 
-// State information that is associated with an I/O request that is currently in flight.
-struct RequestState {
-    // Linux kernal I/O control block which can be submitted to io_submit
-    request: aio::iocb,
+// A future spawned as background task to retrieve I/O completion events from the kernel
+// and distributing the results to the current futures in flight.
+pub struct AioPollFuture {
+    // the context handle for retrieving AIO completions from the kernel
+    context: aio::aio_context_t,
 
-    // Concurrency primitive to notify completion to the associated future
-    completed_receiver: futures::sync::oneshot::Receiver<c_long>,
+    // the eventfd on which the kernel will notify I/O completions
+    eventfd: eventfd::EventFd,
 
-    // We have both sides of a oneshot channel here
-    completed_sender: Option<futures::sync::oneshot::Sender<c_long>>,
+    // a buffer to retrieve completion status from the kernel
+    events: Vec<aio::io_event>,
+}
+
+impl futures::Future for AioPollFuture {
+    type Item = ();
+    type Error = io::Error;
+
+    // This poll function will never return completion
+    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+        loop {
+            // check the eventfd for completed I/O operations
+            let available = match self.eventfd.read() {
+                Err(err) => return Err(err),
+                Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+                Ok(futures::Async::Ready(value)) => value as usize,
+            };
+
+            assert!(available > 0);
+            self.events.clear();
+
+            unsafe {
+                let result = aio::io_getevents(
+                    self.context,
+                    available as c_long,
+                    available as c_long,
+                    self.events.as_mut_ptr(),
+                    ptr::null_mut::<aio::timespec>(),
+                );
+
+                // adjust the vector size to the actual number of items returned
+                if result < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                assert!(result as usize == available);
+                self.events.set_len(available);
+            };
+
+            // dispatch the retrieved events to the associated futures
+            for ref event in &self.events {
+                let request_state: &mut RequestState = unsafe { mem::transmute(event.data) };
+                request_state
+                    .completed_sender
+                    .take()
+                    .unwrap()
+                    .send(event.res)
+                    .unwrap();
+            }
+        }
+    }
 }
 
 // Shared state within AioContext that is backing I/O requests as represented by the individual futures.
@@ -256,7 +344,7 @@ impl Capacity {
 }
 
 // The inner state, which is shared between the AioContext object returned to clients and
-// used internally by futues in flight.
+// used internally by futures in flight.
 struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio::aio_context_t,
@@ -299,13 +387,15 @@ impl Drop for AioContextInner {
     }
 }
 
+/// AioContext provides a submission queue for asycnronous I/O operations to
+/// block devices within the Linux kernel.
 pub struct AioContext {
     inner: std::sync::Arc<AioContextInner>,
+
+    // handle for the spawned background task; dropping it will cancel the task
     _poll_task_handle: futures::sync::oneshot::SpawnHandle<(), io::Error>,
 }
 
-/// AioContext provides a submission queue for asycnronous I/O operations to
-/// block devices within the Linux kernel.
 impl AioContext {
     /// Create a new AioContext that is driven by the provided event loop.
     ///
@@ -359,11 +449,13 @@ impl AioContext {
         AioReadResultFuture {
             base: AioBaseFuture {
                 context: self.inner.clone(),
-                opcode: aio::IOCB_CMD_PREAD,
-                fd,
-                offset,
-                len,
-                buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                iocb_info: IocbInfo {
+                    opcode: aio::IOCB_CMD_PREAD,
+                    fd,
+                    offset,
+                    len,
+                    buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                },
                 state: None,
                 acquire_state: None,
             },
@@ -395,75 +487,17 @@ impl AioContext {
         AioWriteResultFuture {
             base: AioBaseFuture {
                 context: self.inner.clone(),
-                opcode: aio::IOCB_CMD_PWRITE,
-                fd,
-                offset,
-                len,
-                buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                iocb_info: IocbInfo {
+                    opcode: aio::IOCB_CMD_PWRITE,
+                    fd,
+                    offset,
+                    len,
+                    buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                },
                 state: None,
                 acquire_state: None,
             },
             _buffer: buffer,
-        }
-    }
-}
-
-// A future spawned as background task to retrieve I/O completion events from the kernel
-// and distributing the results to the current futures in flight.
-pub struct AioPollFuture {
-    // the context handle for retrieving AIO completions from the kernel
-    context: aio::aio_context_t,
-
-    // the eventfd on which the kernel will notify I/O completions
-    eventfd: eventfd::EventFd,
-
-    // a buffer to retrieve completion status from the kernel
-    events: Vec<aio::io_event>,
-}
-
-impl futures::Future for AioPollFuture {
-    type Item = ();
-    type Error = io::Error;
-
-    // This poll function will never return completion
-    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
-        loop {
-            let available = match self.eventfd.read() {
-                Err(err) => return Err(err),
-                Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
-                Ok(futures::Async::Ready(value)) => value as usize,
-            };
-
-            assert!(available > 0);
-            self.events.clear();
-
-            unsafe {
-                let result = aio::io_getevents(
-                    self.context,
-                    available as c_long,
-                    available as c_long,
-                    self.events.as_mut_ptr(),
-                    ptr::null_mut::<aio::timespec>(),
-                );
-
-                // adjust the vector size to the actual number of items returned
-                if result < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-
-                assert!(result as usize == available);
-                self.events.set_len(available);
-            };
-
-            for ref event in &self.events {
-                let request_state: &mut RequestState = unsafe { mem::transmute(event.data) };
-                request_state
-                    .completed_sender
-                    .take()
-                    .unwrap()
-                    .send(event.res)
-                    .unwrap();
-            }
         }
     }
 }
