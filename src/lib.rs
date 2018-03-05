@@ -24,11 +24,13 @@ extern crate aio_bindings;
 extern crate futures;
 extern crate futures_cpupool;
 extern crate libc;
-extern crate mio;
 extern crate memmap;
+extern crate mio;
 extern crate rand;
 extern crate tokio;
 
+use std::error;
+use std::fmt;
 use std::io;
 use std::mem;
 use std::ops;
@@ -98,7 +100,7 @@ struct AioBaseFuture {
 impl AioBaseFuture {
     // Attempt to submit the I/O request; this may need to wait until a submission slot is
     // available.
-    fn submit_request(&mut self) -> Result<futures::Async<()>, io::Error> {    
+    fn submit_request(&mut self) -> Result<futures::Async<()>, io::Error> {
         if self.state.is_none() {
             // See if we can secure a submission slot
             if self.acquire_state.is_none() {
@@ -205,6 +207,37 @@ impl futures::Future for AioBaseFuture {
     }
 }
 
+/// An error type for I/O operations that allows us to return the memory handle in failure cases.
+pub struct AioError<Handle> {
+    // The buffer handle that we want to return to the caller
+    pub buffer: Handle,
+
+    // The error value
+    pub error: io::Error,
+}
+
+impl<Handle> fmt::Debug for AioError<Handle> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        self.error.fmt(f)
+    }
+}
+
+impl<Handle> fmt::Display for AioError<Handle> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        self.error.fmt(f)
+    }
+}
+
+impl<Handle> error::Error for AioError<Handle> {
+    fn description(&self) -> &str {
+        self.error.description()
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        self.error.cause()
+    }
+}
+
 /// Future returned as result of submitting a read request via `AioContext::read`.
 pub struct AioReadResultFuture<ReadWriteHandle>
 where
@@ -215,18 +248,24 @@ where
 
     // memory handle where data read from the underlying block device is being written to.
     // Holding on to this value is important in the case where it implements Drop.
-    _buffer: ReadWriteHandle,
+    buffer: Option<ReadWriteHandle>,
 }
 
 impl<ReadWriteHandle> futures::Future for AioReadResultFuture<ReadWriteHandle>
 where
     ReadWriteHandle: ops::DerefMut<Target = [u8]>,
 {
-    type Item = ();
-    type Error = io::Error;
+    type Item = ReadWriteHandle;
+    type Error = AioError<ReadWriteHandle>;
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
-        self.base.poll()
+        self.base
+            .poll()
+            .map(|val| val.map(|_| self.buffer.take().unwrap()))
+            .map_err(|err| AioError {
+                buffer: self.buffer.take().unwrap(),
+                error: err,
+            })
     }
 }
 
@@ -240,18 +279,24 @@ where
 
     // memory handle where data written to the underlying block device is being read from.
     // Holding on to this value is important in the case where it implements Drop.
-    _buffer: ReadOnlyHandle,
+    buffer: Option<ReadOnlyHandle>,
 }
 
 impl<ReadOnlyHandle> futures::Future for AioWriteResultFuture<ReadOnlyHandle>
 where
     ReadOnlyHandle: ops::Deref<Target = [u8]>,
 {
-    type Item = ();
-    type Error = io::Error;
+    type Item = ReadOnlyHandle;
+    type Error = AioError<ReadOnlyHandle>;
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
-        self.base.poll()
+        self.base
+            .poll()
+            .map(|val| val.map(|_| self.buffer.take().unwrap()))
+            .map_err(|err| AioError {
+                buffer: self.buffer.take().unwrap(),
+                error: err,
+            })
     }
 }
 
@@ -459,7 +504,7 @@ impl AioContext {
                 state: None,
                 acquire_state: None,
             },
-            _buffer: buffer,
+            buffer: Some(buffer),
         }
     }
 
@@ -497,7 +542,7 @@ impl AioContext {
                 state: None,
                 acquire_state: None,
             },
-            _buffer: buffer,
+            buffer: Some(buffer),
         }
     }
 }
@@ -628,13 +673,12 @@ mod tests {
 
             let pool = futures_cpupool::CpuPool::new(5);
             let buffer = MemoryHandle::new();
-            let result_buffer = buffer.clone();
 
             {
                 let context = AioContext::new(&pool, 10).unwrap();
                 let read_future = context
                     .read(fd, 0, buffer)
-                    .map(move |_| {
+                    .map(move |result_buffer| {
                         assert!(validate_block(&result_buffer));
                     })
                     .map_err(|err| {
@@ -666,7 +710,7 @@ mod tests {
                     assert!(false);
                 })
                 .map_err(|err| {
-                    assert!(err.kind() == io::ErrorKind::Other);
+                    assert!(err.error.kind() == io::ErrorKind::Other);
                     err
                 });
 
@@ -697,18 +741,18 @@ mod tests {
                 let num_slots = 7;
                 let context = AioContext::new(&pool, num_slots).unwrap();
 
-                // 5 waves of requests just going above the lmit
+                // 50 waves of requests just going above the lmit
 
-                // Wave 1
+                // Waves start here
                 for _wave in 0..50 {
                     let mut futures = Vec::new();
 
+                    // Each wave makes 100 I/O requests
                     for index in 0..100 {
                         let buffer = MemoryHandle::new();
-                        let result_buffer = buffer.clone();
                         let read_future = context
                             .read(fd, (index * 8192) % FILE_SIZE, buffer)
-                            .map(move |_| {
+                            .map(move |result_buffer| {
                                 assert!(validate_block(&result_buffer));
                             })
                             .map_err(|err| {

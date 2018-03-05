@@ -25,7 +25,7 @@ use std::io;
 use std::collections;
 
 use futures;
-    
+
 // -----------------------------------------------------------------------------------------------
 // Semaphore that's workable with Futures
 //
