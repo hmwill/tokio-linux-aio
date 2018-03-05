@@ -30,12 +30,11 @@ extern crate tokio;
 extern crate futures_cpupool;
 extern crate memmap;
 
-use std::collections;
 use std::io;
 use std::mem;
 use std::ops;
 use std::ptr;
-use std::sync;
+
 
 use std::os::unix::io::RawFd;
 
@@ -44,99 +43,9 @@ use libc::{c_long, c_void, mlock};
 use futures::Future;
 use ops::Deref;
 
-mod eventfd;
-
 mod aio;
-
-
-// -----------------------------------------------------------------------------------------------
-// Semaphore that's workable with Futures
-//
-// Currently this is rather barebones; may consider expanding it into something library-grade
-// and then exposing it by itself.
-// -----------------------------------------------------------------------------------------------
-
-struct SemaphoreInner {
-    capacity: usize,
-    waiters: collections::VecDeque<futures::sync::oneshot::Sender<()>>,
-}
-
-struct Semaphore {
-    inner: sync::RwLock<SemaphoreInner>,
-}
-
-impl Semaphore {
-    fn new(initial: usize) -> Semaphore {
-        Semaphore {
-            inner: sync::RwLock::new(SemaphoreInner {
-                capacity: initial,
-                waiters: collections::VecDeque::new(),
-            }),
-        }
-    }
-
-    fn acquire(&self) -> SemaphoreHandle {
-        let mut lock_result = self.inner.write();
-
-        match lock_result {
-            Ok(ref mut guard) => {
-                if guard.capacity > 0 {
-                    guard.capacity -= 1;
-                    SemaphoreHandle::Completed(futures::future::result(Ok(())))
-                } else {
-                    let (sender, receiver) = futures::sync::oneshot::channel();
-                    guard.waiters.push_back(sender);
-                    SemaphoreHandle::Waiting(receiver)
-                }
-            }
-            Err(err) => panic!("Lock failure {:?}", err),
-        }
-    }
-
-    fn release(&self) {
-        let mut lock_result = self.inner.write();
-
-        match lock_result {
-            Ok(ref mut guard) => {
-                if !guard.waiters.is_empty() {
-                    guard.waiters.pop_front().unwrap().send(()).unwrap();
-                } else {
-                    guard.capacity += 1;
-                }
-            }
-            Err(err) => panic!("Lock failure {:?}", err),
-        }
-    }
-
-    // For testing code
-    fn current_capacity(&self) -> usize {
-        let mut lock_result = self.inner.read();
-
-        match lock_result {
-            Ok(ref mut guard) => guard.capacity,
-            Err(_) => panic!("Lock failure"),
-        }
-    }
-}
-
-enum SemaphoreHandle {
-    Waiting(futures::sync::oneshot::Receiver<()>),
-    Completed(futures::future::FutureResult<(), io::Error>),
-}
-
-impl futures::Future for SemaphoreHandle {
-    type Item = ();
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
-        match self {
-            &mut SemaphoreHandle::Completed(_) => Ok(futures::Async::Ready(())),
-            &mut SemaphoreHandle::Waiting(ref mut receiver) => receiver
-                .poll()
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err)),
-        }
-    }
-}
+mod eventfd;
+mod sync;
 
 // -----------------------------------------------------------------------------------------------
 // Bindings for Linux AIO start here
@@ -145,7 +54,7 @@ impl futures::Future for SemaphoreHandle {
 // Common data structures for futures returned by `AioContext`.
 struct AioBaseFuture {
     // reference to the `AioContext` that controls the submission queue for asynchronous I/O
-    context: sync::Arc<AioContextInner>,
+    context: std::sync::Arc<AioContextInner>,
 
     // field values that we need to transfer into the IOCB
 
@@ -164,25 +73,18 @@ struct AioBaseFuture {
     // the number of bytes to be transferred, if applicable
     len: u64,
 
-    // state variable tracking if the I/O request associated with this instance has been submitted
-    // to the kernel.
-    submitted: sync::atomic::AtomicBool,
-
     // the associated request state
     state: Option<Box<RequestState>>,
 
     // acquire future
-    acquire_state: Option<SemaphoreHandle>,
+    acquire_state: Option<sync::SemaphoreHandle>,
 }
 
 // Common future base type for all asynchronous operations supperted by this API
 impl AioBaseFuture {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
-        if !self.submitted.load(sync::atomic::Ordering::Acquire) {
+        if self.state.is_none() {
             // See if we can secure a submission slot
-
-            assert!(self.state.is_none());
-
             if self.acquire_state.is_none() {
                 self.acquire_state = Some(self.context.have_capacity.acquire());
             }
@@ -202,27 +104,28 @@ impl AioBaseFuture {
                 }
             }
 
+            assert!(self.state.is_some());
+            let state = self.state.as_mut().unwrap();
+            let state_addr = state.deref().deref() as *const RequestState;
+
             // Fill in the iocb data structure to be submitted to the kernel
-            {
-                assert!(self.state.is_some());
-                let state = self.state.as_mut().unwrap();
-                let state_addr = state.deref().deref() as *const RequestState;
-                state.request.aio_data = unsafe { mem::transmute(state_addr) };
-                state.request.aio_resfd = self.context.completed_fd as u32;
-                state.request.aio_flags = aio::IOCB_FLAG_RESFD;
-                state.request.aio_fildes = self.fd as u32;
-                state.request.aio_offset = self.offset as i64;
-                state.request.aio_buf = self.buf;
-                state.request.aio_nbytes = self.len;
-                state.request.aio_lio_opcode = self.opcode as u16;
-                let (sender, receiver) = futures::sync::oneshot::channel();
-                state.completed_receiver = receiver;
-                state.completed_sender = Some(sender);
-            }
+            state.request.aio_data = unsafe { mem::transmute(state_addr) };
+            state.request.aio_resfd = self.context.completed_fd as u32;
+            state.request.aio_flags = aio::IOCB_FLAG_RESFD;
+            state.request.aio_fildes = self.fd as u32;
+            state.request.aio_offset = self.offset as i64;
+            state.request.aio_buf = self.buf;
+            state.request.aio_nbytes = self.len;
+            state.request.aio_lio_opcode = self.opcode as u16;
+
+            // attach synchronization primitives that are used to indicate completion of this request
+            let (sender, receiver) = futures::sync::oneshot::channel();
+            state.completed_receiver = receiver;
+            state.completed_sender = Some(sender);
 
             // submit the request
             let mut request_ptr_array: [*mut aio::iocb; 1] =
-                [&mut self.state.as_mut().unwrap().request as *mut aio::iocb; 1];
+                [&mut state.request as *mut aio::iocb; 1];
 
             let result = unsafe {
                 aio::io_submit(
@@ -232,15 +135,13 @@ impl AioBaseFuture {
                 )
             };
 
-            // mark that we performed the submission
-            self.submitted.store(true, sync::atomic::Ordering::Release);
-
             // if we have submission error, capture it as future result
             if result != 1 {
                 return Err(io::Error::last_os_error());
             }
         }
 
+        // Check if we have received a notification indicating completion of the I/O request
         let result_code = match self.state.as_mut().unwrap().completed_receiver.poll() {
             Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
             Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
@@ -276,7 +177,7 @@ where
 
     // memory handle where data read from the underlying block device is being written to.
     // Holding on to this value is important in the case where it implements Drop.
-    buffer: ReadWriteHandle,
+    _buffer: ReadWriteHandle,
 }
 
 impl<ReadWriteHandle> futures::Future for AioReadResultFuture<ReadWriteHandle>
@@ -301,7 +202,7 @@ where
 
     // memory handle where data written to the underlying block device is being read from.
     // Holding on to this value is important in the case where it implements Drop.
-    buffer: ReadOnlyHandle,
+    _buffer: ReadOnlyHandle,
 }
 
 impl<ReadOnlyHandle> futures::Future for AioWriteResultFuture<ReadOnlyHandle>
@@ -341,7 +242,7 @@ impl Capacity {
         // using a for loop to properly handle the error case
         // range map collect would only allow for using unwrap(), thereby turning an error into a panic
         for _ in 0..nr {
-            let (sender, receiver) = futures::sync::oneshot::channel();
+            let (_, receiver) = futures::sync::oneshot::channel();
 
             state.push(Box::new(RequestState {
                 request: unsafe { mem::zeroed() },
@@ -366,10 +267,10 @@ struct AioContextInner {
     completed_fd: RawFd,
 
     // do we have capacity?
-    have_capacity: Semaphore,
+    have_capacity: sync::Semaphore,
 
     // pre-allocated eventfds and a capacity semaphore
-    capacity: sync::RwLock<Capacity>,
+    capacity: std::sync::RwLock<Capacity>,
 }
 
 impl AioContextInner {
@@ -384,8 +285,8 @@ impl AioContextInner {
 
         Ok(AioContextInner {
             context,
-            capacity: sync::RwLock::new(Capacity::new(nr)?),
-            have_capacity: Semaphore::new(nr),
+            capacity: std::sync::RwLock::new(Capacity::new(nr)?),
+            have_capacity: sync::Semaphore::new(nr),
             completed_fd: fd,
         })
     }
@@ -399,8 +300,8 @@ impl Drop for AioContextInner {
 }
 
 pub struct AioContext {
-    inner: sync::Arc<AioContextInner>,
-    poll_task_handle: futures::sync::oneshot::SpawnHandle<(), io::Error>,
+    inner: std::sync::Arc<AioContextInner>,
+    _poll_task_handle: futures::sync::oneshot::SpawnHandle<(), io::Error>,
 }
 
 /// AioContext provides a submission queue for asycnronous I/O operations to
@@ -429,8 +330,8 @@ impl AioContext {
         };
 
         Ok(AioContext {
-            inner: sync::Arc::new(inner),
-            poll_task_handle: futures::sync::oneshot::spawn(poll_future, executor),
+            inner: std::sync::Arc::new(inner),
+            _poll_task_handle: futures::sync::oneshot::spawn(poll_future, executor),
         })
     }
 
@@ -463,11 +364,10 @@ impl AioContext {
                 offset,
                 len,
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
-                submitted: sync::atomic::AtomicBool::new(false),
                 state: None,
                 acquire_state: None,
             },
-            buffer,
+            _buffer: buffer,
         }
     }
 
@@ -500,11 +400,10 @@ impl AioContext {
                 offset,
                 len,
                 buf: unsafe { mem::transmute(buffer.as_ptr()) },
-                submitted: sync::atomic::AtomicBool::new(false),
                 state: None,
                 acquire_state: None,
             },
-            buffer,
+            _buffer: buffer,
         }
     }
 }
@@ -724,7 +623,6 @@ mod tests {
 
         let pool = futures_cpupool::CpuPool::new(5);
         let buffer = MemoryHandle::new();
-        let result_buffer = buffer.clone();
 
         {
             let context = AioContext::new(&pool, 10).unwrap();
