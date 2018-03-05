@@ -103,6 +103,9 @@ unsafe fn io_getevents(
 
 // -----------------------------------------------------------------------------------------------
 // Semaphore that's workable with Futures
+//
+// Currently this is rather barebones; may consider expanding it into something library-grade
+// and then exposing it by itself.
 // -----------------------------------------------------------------------------------------------
 
 struct SemaphoreInner {
@@ -111,16 +114,16 @@ struct SemaphoreInner {
 }
 
 struct Semaphore {
-    inner: sync::Arc<sync::RwLock<SemaphoreInner>>,
+    inner: sync::RwLock<SemaphoreInner>,
 }
 
 impl Semaphore {
     fn new(initial: usize) -> Semaphore {
         Semaphore {
-            inner: sync::Arc::new(sync::RwLock::new(SemaphoreInner {
+            inner: sync::RwLock::new(SemaphoreInner {
                 capacity: initial,
                 waiters: collections::VecDeque::new(),
-            })),
+            }),
         }
     }
 
@@ -154,6 +157,16 @@ impl Semaphore {
                 }
             }
             Err(err) => panic!("Lock failure {:?}", err),
+        }
+    }
+
+    // For testing code
+    fn current_capacity(&self) -> usize {
+        let mut lock_result = self.inner.read();
+
+        match lock_result {
+            Ok(ref mut guard) => guard.capacity,
+            Err(_) => panic!("Lock failure"),
         }
     }
 }
@@ -217,8 +230,6 @@ struct AioBaseFuture {
 // Common future base type for all asynchronous operations supperted by this API
 impl AioBaseFuture {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
-        let invalid = -13579;
-
         if !self.submitted.load(sync::atomic::Ordering::Acquire) {
             // See if we can secure a submission slot
 
@@ -256,7 +267,9 @@ impl AioBaseFuture {
                 state.request.aio_buf = self.buf;
                 state.request.aio_nbytes = self.len;
                 state.request.aio_lio_opcode = self.opcode as u16;
-                state.result = invalid;
+                let (sender, receiver) = futures::sync::oneshot::channel();
+                state.completed_receiver = receiver;
+                state.completed_sender = Some(sender);
             }
 
             // submit the request
@@ -277,41 +290,30 @@ impl AioBaseFuture {
             // if we have submission error, capture it as future result
             if result != 1 {
                 return Err(io::Error::last_os_error());
-            } else {
-                // register the current task to be notified upon I/O completion
-                self.state.as_mut().unwrap().completed.register();
-
-                // wait to be polled again
-                return Ok(futures::Async::NotReady);
             }
+        }
+
+        let result_code = match self.state.as_mut().unwrap().completed_receiver.poll() {
+            Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
+            Ok(futures::Async::NotReady) => return Ok(futures::Async::NotReady),
+            Ok(futures::Async::Ready(n)) => n,
+        };
+
+        // Release the kernel queue slot and the state variable that we just processed
+        match self.context.capacity.write() {
+            Ok(ref mut guard) => {
+                guard.state.push(self.state.take().unwrap());
+            }
+            Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
+        }
+
+        // notify others that we release a state slot
+        self.context.have_capacity.release();
+
+        if result_code < 0 {
+            Err(io::Error::from_raw_os_error(result_code as i32))
         } else {
-            let result_code = self.state.as_ref().unwrap().result;
-
-            // triggered in error?
-            if result_code == invalid {
-                panic!("Does this still happen?");
-                // Make sure we get another chance?
-                self.state.as_mut().unwrap().completed.register();
-                
-                return Ok(futures::Async::NotReady);
-            }
-
-            // Release the kernel queue slot and the state variable that we just processed
-            match self.context.capacity.write() {
-                Ok(ref mut guard) => {
-                    guard.state.push(self.state.take().unwrap());
-                }
-                Err(_) => panic!("TODO: Figure out how to handle this kind of error"),
-            }
-
-            // notify others that we release a state slot
-            self.context.have_capacity.release();
-
-            if result_code < 0 {
-                Err(io::Error::from_raw_os_error(result_code as i32))
-            } else {
-                Ok(futures::Async::Ready(()))
-            }
+            Ok(futures::Async::Ready(()))
         }
     }
 }
@@ -372,10 +374,10 @@ struct RequestState {
     request: iocb,
 
     // Concurrency primitive to notify completion to the associated future
-    completed: futures::task::AtomicTask,
+    completed_receiver: futures::sync::oneshot::Receiver<c_long>,
 
-    // the result value of the I/O request
-    result: c_long,
+    // We have both sides of a oneshot channel here
+    completed_sender: Option<futures::sync::oneshot::Sender<c_long>>,
 }
 
 // Shared state within AioContext that is backing I/O requests as represented by the individual futures.
@@ -391,10 +393,12 @@ impl Capacity {
         // using a for loop to properly handle the error case
         // range map collect would only allow for using unwrap(), thereby turning an error into a panic
         for _ in 0..nr {
+            let (sender, receiver) = futures::sync::oneshot::channel();
+
             state.push(Box::new(RequestState {
                 request: unsafe { mem::zeroed() },
-                completed: futures::task::AtomicTask::new(),
-                result: 0,
+                completed_receiver: receiver,
+                completed_sender: None,
             }));
         }
 
@@ -606,9 +610,12 @@ impl futures::Future for AioPollFuture {
 
             for ref event in &self.events {
                 let request_state: &mut RequestState = unsafe { mem::transmute(event.data) };
-
-                request_state.result = event.res;
-                request_state.completed.notify();
+                request_state
+                    .completed_sender
+                    .take()
+                    .unwrap()
+                    .send(event.res)
+                    .unwrap();
             }
         }
     }
@@ -804,15 +811,16 @@ mod tests {
             });
             let fd = owned_fd.fd;
 
-            let pool = futures_cpupool::CpuPool::new(2);
+            let pool = futures_cpupool::CpuPool::new(5);
 
             {
-                let context = AioContext::new(&pool, 7).unwrap();
+                let num_slots = 7;
+                let context = AioContext::new(&pool, num_slots).unwrap();
 
                 // 5 waves of requests just going above the lmit
 
                 // Wave 1
-                for _wave in 0..5 {
+                for _wave in 0..50 {
                     let mut futures = Vec::new();
 
                     for index in 0..100 {
@@ -830,10 +838,13 @@ mod tests {
                         futures.push(pool.spawn(read_future));
                     }
 
-                    // wait for all 50 requests to complete
+                    // wait for all 100 requests to complete
                     let result = futures::future::join_all(futures).wait();
 
                     assert!(result.is_ok());
+
+                    // all slots have been returned
+                    assert!(context.inner.have_capacity.current_capacity() == num_slots);
                 }
             }
         }

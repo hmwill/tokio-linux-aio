@@ -19,6 +19,40 @@ Next, add this to the root module of your crate:
 
 ## Examples
 
+Once you have added the crate to your project you should be able to write something like this:
+
+    // Let's use a standard thread pool
+    let pool = futures_cpupool::CpuPool::new(5);
+
+    // These are handle objects for memory regions
+    let buffer = MemoryHandle::new();
+    let result_buffer = buffer.clone();
+
+    {
+        // Here we go: create an execution context, which uses the pool for background work
+        let context = AioContext::new(&pool, 10).unwrap();
+
+        // Create a future to read from a given file (fd) at the given offset into our buffer
+        let context = AioContext::new(&pool, 10).unwrap();
+        let read_future = context
+            .read(fd, 0, buffer)
+            .map(move |_| {
+                // do something upon successfully reading the data
+                assert!(validate_block(&result_buffer));
+            })
+            .map_err(|err| {
+                // do something else when things go wrong
+                panic!("{:?}", err);
+            });
+
+        // Execute the future and wait for its completion
+        let cpu_future = pool.spawn(read_future);
+        let result = cpu_future.wait();
+
+        // Should be OK
+        assert!(result.is_ok());
+    }
+
 ## License
 
 This code is licensed under the [MIT license](https://github.com/hmwill/tokio-linux-aio/blob/master/LICENSE).
