@@ -36,7 +36,6 @@ Once you have added the crate to your project you should be able to write someth
         let context = AioContext::new(&pool, 10).unwrap();
 
         // Create a future to read from a given file (fd) at the given offset into our buffer
-        let context = AioContext::new(&pool, 10).unwrap();
         let read_future = context
             .read(fd, 0, buffer)
             .map(move |result_buffer| {
