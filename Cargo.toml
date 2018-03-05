@@ -8,7 +8,7 @@ repository= "https://github.com/hmwill/tokio-linux-aio"
 license = "MIT"
 readme = "README.md"
 categories = ["API bindings", "asynchronous", "external FFI bindings", "filesystem", "operating systems"]
-keywords = ["io", "async", "non-blocking", "futures", "linux", "aio", "tokio"]
+keywords = ["async", "non-blocking", "futures", "linux", "aio"]
 
 [dependencies]
 rand = "0.4"
