@@ -10,6 +10,9 @@ readme = "README.md"
 categories = ["API bindings", "asynchronous", "external FFI bindings", "filesystem", "operating systems"]
 keywords = ["async", "non-blocking", "futures", "linux", "aio"]
 
+[badges]
+travis-ci = { repository = "hmwill/tokio-linux-aio" }
+
 [dependencies]
 rand = "0.4"
 tokio = "0.1"

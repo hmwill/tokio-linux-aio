@@ -44,62 +44,10 @@ use libc::{c_long, c_void, mlock};
 use futures::Future;
 use ops::Deref;
 
-// Relevant symbols from the native bindings exposed via aio-bindings
-use aio_bindings::{aio_context_t, io_event, iocb, syscall, timespec, __NR_io_destroy,
-                   __NR_io_getevents, __NR_io_setup, __NR_io_submit, IOCB_CMD_PREAD,
-                   IOCB_CMD_PWRITE, IOCB_FLAG_RESFD};
-
 mod eventfd;
 
-// -----------------------------------------------------------------------------------------------
-// Inline functions that wrap the kernel calls for the entry points corresponding to Linux
-// AIO functions
-// -----------------------------------------------------------------------------------------------
+mod aio;
 
-// Initialize an AIO context for a given submission queue size within the kernel.
-//
-// See [io_setup(7)](http://man7.org/linux/man-pages/man2/io_setup.2.html) for details.
-#[inline(always)]
-unsafe fn io_setup(nr: c_long, ctxp: *mut aio_context_t) -> c_long {
-    syscall(__NR_io_setup as c_long, nr, ctxp)
-}
-
-// Destroy an AIO context.
-//
-// See [io_destroy(7)](http://man7.org/linux/man-pages/man2/io_destroy.2.html) for details.
-#[inline(always)]
-unsafe fn io_destroy(ctx: aio_context_t) -> c_long {
-    syscall(__NR_io_destroy as c_long, ctx)
-}
-
-// Submit a batch of IO operations.
-//
-// See [io_sumit(7)](http://man7.org/linux/man-pages/man2/io_submit.2.html) for details.
-#[inline(always)]
-unsafe fn io_submit(ctx: aio_context_t, nr: c_long, iocbpp: *mut *mut iocb) -> c_long {
-    syscall(__NR_io_submit as c_long, ctx, nr, iocbpp)
-}
-
-// Retrieve completion events for previously submitted IO requests.
-//
-// See [io_getevents(7)](http://man7.org/linux/man-pages/man2/io_getevents.2.html) for details.
-#[inline(always)]
-unsafe fn io_getevents(
-    ctx: aio_context_t,
-    min_nr: c_long,
-    max_nr: c_long,
-    events: *mut io_event,
-    timeout: *mut timespec,
-) -> c_long {
-    syscall(
-        __NR_io_getevents as c_long,
-        ctx,
-        min_nr,
-        max_nr,
-        events,
-        timeout,
-    )
-}
 
 // -----------------------------------------------------------------------------------------------
 // Semaphore that's workable with Futures
@@ -261,7 +209,7 @@ impl AioBaseFuture {
                 let state_addr = state.deref().deref() as *const RequestState;
                 state.request.aio_data = unsafe { mem::transmute(state_addr) };
                 state.request.aio_resfd = self.context.completed_fd as u32;
-                state.request.aio_flags = IOCB_FLAG_RESFD;
+                state.request.aio_flags = aio::IOCB_FLAG_RESFD;
                 state.request.aio_fildes = self.fd as u32;
                 state.request.aio_offset = self.offset as i64;
                 state.request.aio_buf = self.buf;
@@ -273,14 +221,14 @@ impl AioBaseFuture {
             }
 
             // submit the request
-            let mut request_ptr_array: [*mut iocb; 1] =
-                [&mut self.state.as_mut().unwrap().request as *mut iocb; 1];
+            let mut request_ptr_array: [*mut aio::iocb; 1] =
+                [&mut self.state.as_mut().unwrap().request as *mut aio::iocb; 1];
 
             let result = unsafe {
-                io_submit(
+                aio::io_submit(
                     self.context.context,
                     1,
-                    &mut request_ptr_array[0] as *mut *mut iocb,
+                    &mut request_ptr_array[0] as *mut *mut aio::iocb,
                 )
             };
 
@@ -371,7 +319,7 @@ where
 // State information that is associated with an I/O request that is currently in flight.
 struct RequestState {
     // Linux kernal I/O control block which can be submitted to io_submit
-    request: iocb,
+    request: aio::iocb,
 
     // Concurrency primitive to notify completion to the associated future
     completed_receiver: futures::sync::oneshot::Receiver<c_long>,
@@ -410,7 +358,7 @@ impl Capacity {
 // used internally by futues in flight.
 struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
-    context: aio_context_t,
+    context: aio::aio_context_t,
 
     // the fd embedded in the completed eventfd, which can be passed to kernel functions;
     // the handle is managed by the Eventfd object that is owned by the AioPollFuture
@@ -426,10 +374,10 @@ struct AioContextInner {
 
 impl AioContextInner {
     fn new(fd: RawFd, nr: usize) -> Result<AioContextInner, io::Error> {
-        let mut context: aio_context_t = 0;
+        let mut context: aio::aio_context_t = 0;
 
         unsafe {
-            if io_setup(nr as c_long, &mut context) != 0 {
+            if aio::io_setup(nr as c_long, &mut context) != 0 {
                 return Err(io::Error::last_os_error());
             }
         };
@@ -445,7 +393,7 @@ impl AioContextInner {
 
 impl Drop for AioContextInner {
     fn drop(&mut self) {
-        let result = unsafe { io_destroy(self.context) };
+        let result = unsafe { aio::io_destroy(self.context) };
         assert!(result == 0);
     }
 }
@@ -510,7 +458,7 @@ impl AioContext {
         AioReadResultFuture {
             base: AioBaseFuture {
                 context: self.inner.clone(),
-                opcode: IOCB_CMD_PREAD,
+                opcode: aio::IOCB_CMD_PREAD,
                 fd,
                 offset,
                 len,
@@ -547,7 +495,7 @@ impl AioContext {
         AioWriteResultFuture {
             base: AioBaseFuture {
                 context: self.inner.clone(),
-                opcode: IOCB_CMD_PWRITE,
+                opcode: aio::IOCB_CMD_PWRITE,
                 fd,
                 offset,
                 len,
@@ -565,13 +513,13 @@ impl AioContext {
 // and distributing the results to the current futures in flight.
 pub struct AioPollFuture {
     // the context handle for retrieving AIO completions from the kernel
-    context: aio_context_t,
+    context: aio::aio_context_t,
 
     // the eventfd on which the kernel will notify I/O completions
     eventfd: eventfd::EventFd,
 
     // a buffer to retrieve completion status from the kernel
-    events: Vec<io_event>,
+    events: Vec<aio::io_event>,
 }
 
 impl futures::Future for AioPollFuture {
@@ -591,12 +539,12 @@ impl futures::Future for AioPollFuture {
             self.events.clear();
 
             unsafe {
-                let result = io_getevents(
+                let result = aio::io_getevents(
                     self.context,
                     available as c_long,
                     available as c_long,
                     self.events.as_mut_ptr(),
-                    ptr::null_mut::<timespec>(),
+                    ptr::null_mut::<aio::timespec>(),
                 );
 
                 // adjust the vector size to the actual number of items returned
