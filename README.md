@@ -30,7 +30,6 @@ Once you have added the crate to your project you should be able to write someth
 
     // These are handle objects for memory regions
     let buffer = MemoryHandle::new();
-    let result_buffer = buffer.clone();
 
     {
         // Here we go: create an execution context, which uses the pool for background work
@@ -40,7 +39,7 @@ Once you have added the crate to your project you should be able to write someth
         let context = AioContext::new(&pool, 10).unwrap();
         let read_future = context
             .read(fd, 0, buffer)
-            .map(move |_| {
+            .map(move |result_buffer| {
                 // do something upon successfully reading the data
                 assert!(validate_block(&result_buffer));
             })
