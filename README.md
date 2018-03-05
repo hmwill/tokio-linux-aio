@@ -1,5 +1,7 @@
 # tokio-linux-aio
 
+[![Version](https://img.shields.io/crates/v/tokio-linux-aio.svg)](https://crates.io/crates/tokio-linux-aio) 
+[![License](https://img.shields.io/crates/l/tokio-linux-aio.svg)](https://crates.io/crates/tokio-linux-aio) 
 [![Build Status](https://travis-ci.org/hmwill/tokio-linux-aio.svg?branch=master)](https://travis-ci.org/hmwill/tokio-linux-aio)
 
 This package provides an integration of Linux kernel-level asynchronous I/O to the [Tokio platform](https://tokio.rs/). 
