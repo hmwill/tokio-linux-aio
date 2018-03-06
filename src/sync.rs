@@ -110,7 +110,7 @@ impl futures::Future for SemaphoreHandle {
             &mut SemaphoreHandle::Waiting => {
                 *self = SemaphoreHandle::Completed(futures::future::result(Ok(())));
                 Ok(futures::Async::NotReady)
-            },
+            }
         }
     }
 }

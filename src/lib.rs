@@ -20,43 +20,42 @@
 // SOFTWARE.
 // ===============================================================================================
 
-
-//! Tokio Bindings for Linux Kernel AIO 
-//! 
-//! This package provides an integration of Linux kernel-level asynchronous I/O to the 
+//! Tokio Bindings for Linux Kernel AIO
+//!
+//! This package provides an integration of Linux kernel-level asynchronous I/O to the
 //! [Tokio platform](https://tokio.rs/).
 //!
-//! Linux kernel-level asynchronous I/O is different from the [Posix AIO library](http://man7.org/linux/man-pages/man7/aio.7.html). 
-//! Posix AIO is implemented using a pool of userland threads, which invoke regular, blocking system 
-//! calls to perform file I/O. [Linux kernel-level AIO](http://lse.sourceforge.net/io/aio.html), on the 
+//! Linux kernel-level asynchronous I/O is different from the [Posix AIO library](http://man7.org/linux/man-pages/man7/aio.7.html).
+//! Posix AIO is implemented using a pool of userland threads, which invoke regular, blocking system
+//! calls to perform file I/O. [Linux kernel-level AIO](http://lse.sourceforge.net/io/aio.html), on the
 //! other hand, provides kernel-level asynchronous scheduling of I/O operations to the underlying block device.
-//! 
-//! The core abstraction exposed by this library is the `AioContext`, which essentially wraps 
+//!
+//! The core abstraction exposed by this library is the `AioContext`, which essentially wraps
 //! a kernel-level I/O submission queue with limited capacity. The capacity of the underlying queue
 //! is a constructor argument when creating an instance of `AioContext`. Once created, the context
 //! can be used to issue read and write requests. Each such invocations will create a suitable instance
 //! of `futures::Future`, which can be executed within the context of Tokio.
-//! 
+//!
 //! There's a few gotchas to be aware of when using this library:
-//! 
-//! 1. Linux AIO requires the underlying file to be opened in direct mode (`O_DIRECT`), bypassing 
+//!
+//! 1. Linux AIO requires the underlying file to be opened in direct mode (`O_DIRECT`), bypassing
 //! any other buffering at the OS level. If you attempt to use this library on files opened regularly,
 //! likely it won't work.
-//! 
-//! 2. Because Linux AIO operates on files in direct mode, by corrollary the memory buffers associated 
+//!
+//! 2. Because Linux AIO operates on files in direct mode, by corrollary the memory buffers associated
 //! with read/write requests need to be suitable for direct DMA transfers. This means that those buffers
 //! should be aligned to hardware page boundaries, and the memory needs to be mapped to pysical RAM.
 //! The best wahy to accomplish this is to have a ammped region that is locked in physical memory.
-//! 
+//!
 //! 3. Due to the asynchronous nature of this library, memory buffers are represented using generic
 //! handle types. For the purpose of the inner workings of this library, the important aspect is that
 //! those handle types can be dereferenced into a `&[u8]` or, respectively, a `&mut [u8]` type. Because
 //! we hand off those buffers to the kernel (and ultimately hardware DMA) it is mandatory that those
 //! bytes slices have a fixed address in main memory during I/O processing.
-//! 
-//! 4. The general idea is that those generic handle types for memory access can implement smart 
+//!
+//! 4. The general idea is that those generic handle types for memory access can implement smart
 //! pointer semantics. For example, a conceivable implementation of a memory handle type is a smart
-//! pointer that acquires a write-lock on a page while a data transfer is in progress, and releases 
+//! pointer that acquires a write-lock on a page while a data transfer is in progress, and releases
 //! such a lock once the operation has completed.
 
 extern crate aio_bindings;
@@ -447,7 +446,7 @@ struct AioContextInner {
     // handle for the spawned background task; dropping it will cancel the task
     // we are using an Option value with delayed initialization to keep the generic
     // executor type parameter out of AioContextInner
-    poll_task_handle: Option<futures::sync::oneshot::SpawnHandle<(), io::Error>>,    
+    poll_task_handle: Option<futures::sync::oneshot::SpawnHandle<(), io::Error>>,
 }
 
 impl AioContextInner {
@@ -849,35 +848,35 @@ mod tests {
             let context4 = context.clone();
             let context5 = context.clone();
             let context6 = context.clone();
-            
+
             context1
-            .read(fd, 8192, buffer1)
-            .map(|mut buffer| -> MemoryHandle {
-                assert!(validate_block(buffer.deref()));
-                fill_pattern(0u8, &mut buffer);
-                buffer
-            })
-            .and_then(move |buffer| context2.write(fd, 8192, buffer))
-            .and_then(move |buffer| context3.read(fd, 0, buffer))
-            .map(|mut buffer| -> MemoryHandle {
-                assert!(validate_block(&buffer));
-                fill_pattern(1u8, &mut buffer);
-                buffer
-            })
-            .and_then(move |buffer| context4.write(fd, 0, buffer))
-            .and_then(move |buffer| context5.read(fd, 8192, buffer))
-            .map(|buffer| -> MemoryHandle {
-                assert!(validate_pattern(0u8, &buffer));
-                buffer
-            })
-            .and_then(move |buffer| context6.read(fd, 0, buffer))
-            .map(|buffer| -> MemoryHandle {
-                assert!(validate_pattern(1u8, &buffer));
-                buffer
-            })
-            .map_err(|err| {
-                panic!("{:?}", err);
-            })
+                .read(fd, 8192, buffer1)
+                .map(|mut buffer| -> MemoryHandle {
+                    assert!(validate_block(buffer.deref()));
+                    fill_pattern(0u8, &mut buffer);
+                    buffer
+                })
+                .and_then(move |buffer| context2.write(fd, 8192, buffer))
+                .and_then(move |buffer| context3.read(fd, 0, buffer))
+                .map(|mut buffer| -> MemoryHandle {
+                    assert!(validate_block(&buffer));
+                    fill_pattern(1u8, &mut buffer);
+                    buffer
+                })
+                .and_then(move |buffer| context4.write(fd, 0, buffer))
+                .and_then(move |buffer| context5.read(fd, 8192, buffer))
+                .map(|buffer| -> MemoryHandle {
+                    assert!(validate_pattern(0u8, &buffer));
+                    buffer
+                })
+                .and_then(move |buffer| context6.read(fd, 0, buffer))
+                .map(|buffer| -> MemoryHandle {
+                    assert!(validate_pattern(1u8, &buffer));
+                    buffer
+                })
+                .map_err(|err| {
+                    panic!("{:?}", err);
+                })
         };
 
         // Second access sequence
@@ -891,35 +890,35 @@ mod tests {
             let context4 = context.clone();
             let context5 = context.clone();
             let context6 = context.clone();
-            
+
             context1
-            .read(fd, 16384, buffer2)
-            .map(|mut buffer| -> MemoryHandle {
-                assert!(validate_block(buffer.deref()));
-                fill_pattern(2u8, &mut buffer);
-                buffer
-            })
-            .and_then(move |buffer| context2.write(fd, 16384, buffer))
-            .and_then(move |buffer| context3.read(fd, 24576, buffer))
-            .map(|mut buffer| -> MemoryHandle {
-                assert!(validate_block(&buffer));
-                fill_pattern(3u8, &mut buffer);
-                buffer
-            })
-            .and_then(move |buffer| context4.write(fd, 24576, buffer))
-            .and_then(move |buffer| context5.read(fd, 16384, buffer))
-            .map(|buffer| -> MemoryHandle {
-                assert!(validate_pattern(2u8, &buffer));
-                buffer
-            })
-            .and_then(move |buffer| context6.read(fd, 24576, buffer))
-            .map(|buffer| -> MemoryHandle {
-                assert!(validate_pattern(3u8, &buffer));
-                buffer
-            })
-            .map_err(|err| {
-                panic!("{:?}", err);
-            })
+                .read(fd, 16384, buffer2)
+                .map(|mut buffer| -> MemoryHandle {
+                    assert!(validate_block(buffer.deref()));
+                    fill_pattern(2u8, &mut buffer);
+                    buffer
+                })
+                .and_then(move |buffer| context2.write(fd, 16384, buffer))
+                .and_then(move |buffer| context3.read(fd, 24576, buffer))
+                .map(|mut buffer| -> MemoryHandle {
+                    assert!(validate_block(&buffer));
+                    fill_pattern(3u8, &mut buffer);
+                    buffer
+                })
+                .and_then(move |buffer| context4.write(fd, 24576, buffer))
+                .and_then(move |buffer| context5.read(fd, 16384, buffer))
+                .map(|buffer| -> MemoryHandle {
+                    assert!(validate_pattern(2u8, &buffer));
+                    buffer
+                })
+                .and_then(move |buffer| context6.read(fd, 24576, buffer))
+                .map(|buffer| -> MemoryHandle {
+                    assert!(validate_pattern(3u8, &buffer));
+                    buffer
+                })
+                .map_err(|err| {
+                    panic!("{:?}", err);
+                })
         };
 
         // Third access sequence
@@ -933,35 +932,35 @@ mod tests {
             let context4 = context.clone();
             let context5 = context.clone();
             let context6 = context.clone();
-            
+
             context1
-            .read(fd, 40960, buffer3)
-            .map(|mut buffer| -> MemoryHandle {
-                assert!(validate_block(buffer.deref()));
-                fill_pattern(5u8, &mut buffer);
-                buffer
-            })
-            .and_then(move |buffer| context2.write(fd, 40960, buffer))
-            .and_then(move |buffer| context3.read(fd, 32768, buffer))
-            .map(|mut buffer| -> MemoryHandle {
-                assert!(validate_block(&buffer));
-                fill_pattern(6u8, &mut buffer);
-                buffer
-            })
-            .and_then(move |buffer| context4.write(fd, 32768, buffer))
-            .and_then(move |buffer| context5.read(fd, 40960, buffer))
-            .map(|buffer| -> MemoryHandle {
-                assert!(validate_pattern(5u8, &buffer));
-                buffer
-            })
-            .and_then(move |buffer| context6.read(fd, 32768, buffer))
-            .map(|buffer| -> MemoryHandle {
-                assert!(validate_pattern(6u8, &buffer));
-                buffer
-            })
-            .map_err(|err| {
-                panic!("{:?}", err);
-            })
+                .read(fd, 40960, buffer3)
+                .map(|mut buffer| -> MemoryHandle {
+                    assert!(validate_block(buffer.deref()));
+                    fill_pattern(5u8, &mut buffer);
+                    buffer
+                })
+                .and_then(move |buffer| context2.write(fd, 40960, buffer))
+                .and_then(move |buffer| context3.read(fd, 32768, buffer))
+                .map(|mut buffer| -> MemoryHandle {
+                    assert!(validate_block(&buffer));
+                    fill_pattern(6u8, &mut buffer);
+                    buffer
+                })
+                .and_then(move |buffer| context4.write(fd, 32768, buffer))
+                .and_then(move |buffer| context5.read(fd, 40960, buffer))
+                .map(|buffer| -> MemoryHandle {
+                    assert!(validate_pattern(5u8, &buffer));
+                    buffer
+                })
+                .and_then(move |buffer| context6.read(fd, 32768, buffer))
+                .map(|buffer| -> MemoryHandle {
+                    assert!(validate_pattern(6u8, &buffer));
+                    buffer
+                })
+                .map_err(|err| {
+                    panic!("{:?}", err);
+                })
         };
 
         // Launch the three futures
