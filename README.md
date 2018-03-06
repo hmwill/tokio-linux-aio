@@ -1,10 +1,9 @@
 # tokio-linux-aio
 
-[![Join the chat at https://gitter.im/tokio-linux-aio/Lobby](https://badges.gitter.im/tokio-linux-aio/Lobby.svg)](https://gitter.im/tokio-linux-aio/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-
 [![Version](https://img.shields.io/crates/v/tokio-linux-aio.svg)](https://crates.io/crates/tokio-linux-aio)
 [![License](https://img.shields.io/crates/l/tokio-linux-aio.svg)](https://github.com/hmwill/tokio-linux-aio/blob/master/LICENSE)
 [![Build Status](https://travis-ci.org/hmwill/tokio-linux-aio.svg?branch=master)](https://travis-ci.org/hmwill/tokio-linux-aio)
+[![Join the chat at https://gitter.im/tokio-linux-aio/Lobby](https://badges.gitter.im/tokio-linux-aio/Lobby.svg)](https://gitter.im/tokio-linux-aio/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 This package provides an integration of Linux kernel-level asynchronous I/O to the [Tokio platform](https://tokio.rs/).
 
