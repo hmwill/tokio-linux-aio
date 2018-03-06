@@ -20,6 +20,45 @@
 // SOFTWARE.
 // ===============================================================================================
 
+
+//! Tokio Bindings for Linux Kernel AIO 
+//! 
+//! This package provides an integration of Linux kernel-level asynchronous I/O to the 
+//! [Tokio platform](https://tokio.rs/).
+//!
+//! Linux kernel-level asynchronous I/O is different from the [Posix AIO library](http://man7.org/linux/man-pages/man7/aio.7.html). 
+//! Posix AIO is implemented using a pool of userland threads, which invoke regular, blocking system 
+//! calls to perform file I/O. [Linux kernel-level AIO](http://lse.sourceforge.net/io/aio.html), on the 
+//! other hand, provides kernel-level asynchronous scheduling of I/O operations to the underlying block device.
+//! 
+//! The core abstraction exposed by this library is the `AioContext`, which essentially wraps 
+//! a kernel-level I/O submission queue with limited capacity. The capacity of the underlying queue
+//! is a constructor argument when creating an instance of `AioContext`. Once created, the context
+//! can be used to issue read and write requests. Each such invocations will create a suitable instance
+//! of `futures::Future`, which can be executed within the context of Tokio.
+//! 
+//! There's a few gotchas to be aware of when using this library:
+//! 
+//! 1. Linux AIO requires the underlying file to be opened in direct mode (`O_DIRECT`), bypassing 
+//! any other buffering at the OS level. If you attempt to use this library on files opened regularly,
+//! likely it won't work.
+//! 
+//! 2. Because Linux AIO operates on files in direct mode, by corrollary the memory buffers associated 
+//! with read/write requests need to be suitable for direct DMA transfers. This means that those buffers
+//! should be aligned to hardware page boundaries, and the memory needs to be mapped to pysical RAM.
+//! The best wahy to accomplish this is to have a ammped region that is locked in physical memory.
+//! 
+//! 3. Due to the asynchronous nature of this library, memory buffers are represented using generic
+//! handle types. For the purpose of the inner workings of this library, the important aspect is that
+//! those handle types can be dereferenced into a `&[u8]` or, respectively, a `&mut [u8]` type. Because
+//! we hand off those buffers to the kernel (and ultimately hardware DMA) it is mandatory that those
+//! bytes slices have a fixed address in main memeory during I/O processing.
+//! 
+//! 4. The general idea is that those generic handle types for memory access can implement smart 
+//! pointer semantics. For example, a conceivable implementation of a memory handle type is a smart
+//! pointer that acquires a write-lock on a page while a data transfer is in progress, and releases 
+//! such a lock, once the operation has completed.
+
 extern crate aio_bindings;
 extern crate futures;
 extern crate futures_cpupool;
