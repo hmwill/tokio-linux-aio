@@ -52,12 +52,12 @@
 //! handle types. For the purpose of the inner workings of this library, the important aspect is that
 //! those handle types can be dereferenced into a `&[u8]` or, respectively, a `&mut [u8]` type. Because
 //! we hand off those buffers to the kernel (and ultimately hardware DMA) it is mandatory that those
-//! bytes slices have a fixed address in main memeory during I/O processing.
+//! bytes slices have a fixed address in main memory during I/O processing.
 //! 
 //! 4. The general idea is that those generic handle types for memory access can implement smart 
 //! pointer semantics. For example, a conceivable implementation of a memory handle type is a smart
 //! pointer that acquires a write-lock on a page while a data transfer is in progress, and releases 
-//! such a lock, once the operation has completed.
+//! such a lock once the operation has completed.
 
 extern crate aio_bindings;
 extern crate futures;
