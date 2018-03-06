@@ -1,13 +1,13 @@
 [package]
 name = "tokio-linux-aio"
-version = "0.1.7"
+version = "0.1.8"
 authors = ["Hans-Martin Will <hwill@acm.org>"]
 description = "Tokio bindings for Linux kernel AIO"
 documentation = "https://docs.rs/tokio-linux-aio/"
 repository= "https://github.com/hmwill/tokio-linux-aio"
 license = "MIT"
 readme = "README.md"
-categories = ["API bindings", "asynchronous", "external FFI bindings", "filesystem", "operating systems"]
+categories = ["api-bindings", "asynchronous", "external-ffi-bindings", "filesystem", "os::unix-apis"]
 keywords = ["async", "non-blocking", "futures", "linux", "aio"]
 
 [badges]
