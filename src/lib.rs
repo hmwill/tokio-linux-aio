@@ -45,7 +45,7 @@
 //! 2. Because Linux AIO operates on files in direct mode, by corrollary the memory buffers associated
 //! with read/write requests need to be suitable for direct DMA transfers. This means that those buffers
 //! should be aligned to hardware page boundaries, and the memory needs to be mapped to pysical RAM.
-//! The best wahy to accomplish this is to have a ammped region that is locked in physical memory.
+//! The best way to accomplish this is to have a mmapped region that is locked in physical memory.
 //!
 //! 3. Due to the asynchronous nature of this library, memory buffers are represented using generic
 //! handle types. For the purpose of the inner workings of this library, the important aspect is that
