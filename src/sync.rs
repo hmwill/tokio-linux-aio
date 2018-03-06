@@ -35,7 +35,7 @@ use futures;
 
 struct SemaphoreInner {
     capacity: usize,
-    waiters: collections::VecDeque<futures::sync::oneshot::Sender<()>>,
+    waiters: collections::VecDeque<futures::task::Task>,
 }
 
 pub struct Semaphore {
@@ -61,9 +61,8 @@ impl Semaphore {
                     guard.capacity -= 1;
                     SemaphoreHandle::Completed(futures::future::result(Ok(())))
                 } else {
-                    let (sender, receiver) = futures::sync::oneshot::channel();
-                    guard.waiters.push_back(sender);
-                    SemaphoreHandle::Waiting(receiver)
+                    guard.waiters.push_back(futures::task::current());
+                    SemaphoreHandle::Waiting
                 }
             }
             Err(err) => panic!("Lock failure {:?}", err),
@@ -76,7 +75,7 @@ impl Semaphore {
         match lock_result {
             Ok(ref mut guard) => {
                 if !guard.waiters.is_empty() {
-                    guard.waiters.pop_front().unwrap().send(()).unwrap();
+                    guard.waiters.pop_front().unwrap().notify();
                 } else {
                     guard.capacity += 1;
                 }
@@ -97,7 +96,7 @@ impl Semaphore {
 }
 
 pub enum SemaphoreHandle {
-    Waiting(futures::sync::oneshot::Receiver<()>),
+    Waiting,
     Completed(futures::future::FutureResult<(), io::Error>),
 }
 
@@ -108,9 +107,10 @@ impl futures::Future for SemaphoreHandle {
     fn poll(&mut self) -> Result<futures::Async<()>, io::Error> {
         match self {
             &mut SemaphoreHandle::Completed(_) => Ok(futures::Async::Ready(())),
-            &mut SemaphoreHandle::Waiting(ref mut receiver) => receiver
-                .poll()
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err)),
+            &mut SemaphoreHandle::Waiting => {
+                *self = SemaphoreHandle::Completed(futures::future::result(Ok(())));
+                Ok(futures::Async::NotReady)
+            },
         }
     }
 }
