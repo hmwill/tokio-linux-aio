@@ -404,6 +404,11 @@ struct AioContextInner {
 
     // pre-allocated eventfds and a capacity semaphore
     capacity: std::sync::RwLock<Capacity>,
+
+    // handle for the spawned background task; dropping it will cancel the task
+    // we are using an Option value with delayed initialization to keep the generic
+    // executor type parameter out of AioContextInner
+    poll_task_handle: Option<futures::sync::oneshot::SpawnHandle<(), io::Error>>,    
 }
 
 impl AioContextInner {
@@ -421,6 +426,7 @@ impl AioContextInner {
             capacity: std::sync::RwLock::new(Capacity::new(nr)?),
             have_capacity: sync::Semaphore::new(nr),
             completed_fd: fd,
+            poll_task_handle: None,
         })
     }
 }
@@ -434,11 +440,9 @@ impl Drop for AioContextInner {
 
 /// AioContext provides a submission queue for asycnronous I/O operations to
 /// block devices within the Linux kernel.
+#[derive(Clone)]
 pub struct AioContext {
     inner: std::sync::Arc<AioContextInner>,
-
-    // handle for the spawned background task; dropping it will cancel the task
-    _poll_task_handle: futures::sync::oneshot::SpawnHandle<(), io::Error>,
 }
 
 impl AioContext {
@@ -455,7 +459,7 @@ impl AioContext {
         let eventfd = eventfd::EventFd::create(0, false)?;
         let fd = eventfd.evented.get_ref().fd;
 
-        let inner = AioContextInner::new(fd, nr)?;
+        let mut inner = AioContextInner::new(fd, nr)?;
         let context = inner.context;
 
         let poll_future = AioPollFuture {
@@ -464,9 +468,10 @@ impl AioContext {
             events: Vec::with_capacity(nr),
         };
 
+        inner.poll_task_handle = Some(futures::sync::oneshot::spawn(poll_future, executor));
+
         Ok(AioContext {
             inner: std::sync::Arc::new(inner),
-            _poll_task_handle: futures::sync::oneshot::spawn(poll_future, executor),
         })
     }
 
@@ -774,6 +779,188 @@ mod tests {
         }
 
         remove_file(&file_name);
+    }
+
+    // A test with a mixed read/write workload
+    #[test]
+    fn mixed_read_write() {
+        let file_name = temp_file_name();
+        create_temp_file(&file_name);
+
+        let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
+            open(
+                mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
+                O_DIRECT | O_RDWR,
+            )
+        });
+        let fd = owned_fd.fd;
+
+        let mut futures = Vec::new();
+
+        let pool = futures_cpupool::CpuPool::new(5);
+        let context = AioContext::new(&pool, 7).unwrap();
+
+        // First access sequence
+        let buffer1 = MemoryHandle::new();
+
+        let sequence1 = {
+            let context1 = context.clone();
+            let context2 = context.clone();
+            let context3 = context.clone();
+            let context4 = context.clone();
+            let context5 = context.clone();
+            let context6 = context.clone();
+            
+            context1
+            .read(fd, 8192, buffer1)
+            .map(|mut buffer| -> MemoryHandle {
+                assert!(validate_block(buffer.deref()));
+                fill_pattern(0u8, &mut buffer);
+                buffer
+            })
+            .and_then(move |buffer| context2.write(fd, 8192, buffer))
+            .and_then(move |buffer| context3.read(fd, 0, buffer))
+            .map(|mut buffer| -> MemoryHandle {
+                assert!(validate_block(&buffer));
+                fill_pattern(1u8, &mut buffer);
+                buffer
+            })
+            .and_then(move |buffer| context4.write(fd, 0, buffer))
+            .and_then(move |buffer| context5.read(fd, 8192, buffer))
+            .map(|buffer| -> MemoryHandle {
+                assert!(validate_pattern(0u8, &buffer));
+                buffer
+            })
+            .and_then(move |buffer| context6.read(fd, 0, buffer))
+            .map(|buffer| -> MemoryHandle {
+                assert!(validate_pattern(1u8, &buffer));
+                buffer
+            })
+            .map_err(|err| {
+                panic!("{:?}", err);
+            })
+        };
+
+        // Second access sequence
+
+        let buffer2 = MemoryHandle::new();
+
+        let sequence2 = {
+            let context1 = context.clone();
+            let context2 = context.clone();
+            let context3 = context.clone();
+            let context4 = context.clone();
+            let context5 = context.clone();
+            let context6 = context.clone();
+            
+            context1
+            .read(fd, 16384, buffer2)
+            .map(|mut buffer| -> MemoryHandle {
+                assert!(validate_block(buffer.deref()));
+                fill_pattern(2u8, &mut buffer);
+                buffer
+            })
+            .and_then(move |buffer| context2.write(fd, 16384, buffer))
+            .and_then(move |buffer| context3.read(fd, 24576, buffer))
+            .map(|mut buffer| -> MemoryHandle {
+                assert!(validate_block(&buffer));
+                fill_pattern(3u8, &mut buffer);
+                buffer
+            })
+            .and_then(move |buffer| context4.write(fd, 24576, buffer))
+            .and_then(move |buffer| context5.read(fd, 16384, buffer))
+            .map(|buffer| -> MemoryHandle {
+                assert!(validate_pattern(2u8, &buffer));
+                buffer
+            })
+            .and_then(move |buffer| context6.read(fd, 24576, buffer))
+            .map(|buffer| -> MemoryHandle {
+                assert!(validate_pattern(3u8, &buffer));
+                buffer
+            })
+            .map_err(|err| {
+                panic!("{:?}", err);
+            })
+        };
+
+        // Third access sequence
+
+        let buffer3 = MemoryHandle::new();
+
+        let sequence3 = {
+            let context1 = context.clone();
+            let context2 = context.clone();
+            let context3 = context.clone();
+            let context4 = context.clone();
+            let context5 = context.clone();
+            let context6 = context.clone();
+            
+            context1
+            .read(fd, 40960, buffer3)
+            .map(|mut buffer| -> MemoryHandle {
+                assert!(validate_block(buffer.deref()));
+                fill_pattern(5u8, &mut buffer);
+                buffer
+            })
+            .and_then(move |buffer| context2.write(fd, 40960, buffer))
+            .and_then(move |buffer| context3.read(fd, 32768, buffer))
+            .map(|mut buffer| -> MemoryHandle {
+                assert!(validate_block(&buffer));
+                fill_pattern(6u8, &mut buffer);
+                buffer
+            })
+            .and_then(move |buffer| context4.write(fd, 32768, buffer))
+            .and_then(move |buffer| context5.read(fd, 40960, buffer))
+            .map(|buffer| -> MemoryHandle {
+                assert!(validate_pattern(5u8, &buffer));
+                buffer
+            })
+            .and_then(move |buffer| context6.read(fd, 32768, buffer))
+            .map(|buffer| -> MemoryHandle {
+                assert!(validate_pattern(6u8, &buffer));
+                buffer
+            })
+            .map_err(|err| {
+                panic!("{:?}", err);
+            })
+        };
+
+        // Launch the three futures
+        futures.push(pool.spawn(sequence1));
+        futures.push(pool.spawn(sequence2));
+        futures.push(pool.spawn(sequence3));
+
+        // Wair for completion
+        let result = futures::future::join_all(futures).wait();
+
+        assert!(result.is_ok());
+    }
+
+    // Fille the buffer with a pattern that has a dependency on the provided key.
+    fn fill_pattern(key: u8, buffer: &mut [u8]) {
+        // The pattern we generate is an alternation of the key value and an index value
+        // For this we ensure that the buffer has an even number of elements
+        assert!(buffer.len() % 2 == 0);
+
+        for index in 0..buffer.len() / 2 {
+            buffer[index * 2] = key;
+            buffer[index * 2 + 1] = index as u8;
+        }
+    }
+
+    // Validate that the buffer is filled with a pattern as generated by the provided key.
+    fn validate_pattern(key: u8, buffer: &[u8]) -> bool {
+        // The pattern we generate is an alternation of the key value and an index value
+        // For this we ensure that the buffer has an even number of elements
+        assert!(buffer.len() % 2 == 0);
+
+        for index in 0..buffer.len() / 2 {
+            if (buffer[index * 2] != key) || (buffer[index * 2 + 1] != (index as u8)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     fn validate_block(data: &[u8]) -> bool {
