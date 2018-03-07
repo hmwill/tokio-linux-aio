@@ -739,6 +739,49 @@ mod tests {
     }
 
     #[test]
+    fn write_block_mt() {
+        use io::{Read, Seek};
+
+        let file_name = temp_file_name();
+        create_temp_file(&file_name);
+
+        {
+            let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
+                open(
+                    mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
+                    O_DIRECT | O_RDWR,
+                )
+            });
+            let fd = owned_fd.fd;
+
+            let pool = futures_cpupool::CpuPool::new(5);
+            let mut buffer = MemoryHandle::new();
+
+            fill_pattern(65u8, &mut buffer);
+
+            {
+                let context = AioContext::new(&pool, 2).unwrap();
+                let write_future = context.write(fd, 16384, buffer).map_err(|err| {
+                    panic!("{:?}", err);
+                });
+
+                let cpu_future = pool.spawn(write_future);
+                let result = cpu_future.wait();
+
+                assert!(result.is_ok());
+            }
+        }
+
+        let mut file = fs::File::open(&file_name).unwrap();
+        file.seek(io::SeekFrom::Start(16384)).unwrap();
+
+        let mut read_buffer: [u8; 8192] = [0u8; 8192];
+        file.read(&mut read_buffer).unwrap();
+
+        assert!(validate_pattern(65u8, &read_buffer));
+    }
+
+    #[test]
     fn read_invalid_fd() {
         let fd = 2431;
 
@@ -762,6 +805,43 @@ mod tests {
 
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn invalid_offset() {
+        let file_name = temp_file_name();
+        create_temp_file(&file_name);
+
+        {
+            let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
+                open(
+                    mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
+                    O_DIRECT | O_RDWR,
+                )
+            });
+            let fd = owned_fd.fd;
+
+            let pool = futures_cpupool::CpuPool::new(5);
+            let buffer = MemoryHandle::new();
+
+            let context = AioContext::new(&pool, 10).unwrap();
+            let read_future = context
+                .read(fd, 1000000, buffer)
+                .map(move |_| {
+                    assert!(false);
+                })
+                .map_err(|err| {
+                    assert!(err.error.kind() == io::ErrorKind::Other);
+                    err
+                });
+
+            let cpu_future = pool.spawn(read_future);
+            let result = cpu_future.wait();
+
+            assert!(result.is_err());
+        }
+
+        remove_file(&file_name);
     }
 
     #[test]
