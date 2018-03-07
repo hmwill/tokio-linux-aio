@@ -809,7 +809,7 @@ mod tests {
 
     /*
     For some reason, this test does not pass on Travis. Need to research why the out-of-range
-    file offset does not trip an inavlid argument error.
+    file offset does not trip an invalid argument error.
 
     #[test]
     fn invalid_offset() {
