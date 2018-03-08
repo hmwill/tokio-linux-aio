@@ -341,7 +341,8 @@ where
     }
 }
 
-/// Future returned as result of submitting a write request via `AioContext::write`.
+/// Future returned as result of submitting a write request via `AioContext::sync` or
+/// `AioContext::data_sync`.
 pub struct AioSyncResultFuture
 {
     // common AIO future state
