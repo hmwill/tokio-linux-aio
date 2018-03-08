@@ -106,6 +106,9 @@ struct IocbInfo {
 
     // the number of bytes to be transferred, if applicable
     len: u64,
+
+    // flags to provide additional parameters 
+    flags: u32,
 }
 
 // State information that is associated with an I/O request that is currently in flight.
@@ -167,7 +170,7 @@ impl AioBaseFuture {
             // Fill in the iocb data structure to be submitted to the kernel
             state.request.aio_data = unsafe { mem::transmute(state_addr) };
             state.request.aio_resfd = self.context.completed_fd as u32;
-            state.request.aio_flags = aio::IOCB_FLAG_RESFD;
+            state.request.aio_flags = aio::IOCB_FLAG_RESFD | self.iocb_info.flags;
             state.request.aio_fildes = self.iocb_info.fd as u32;
             state.request.aio_offset = self.iocb_info.offset as i64;
             state.request.aio_buf = self.iocb_info.buf;
@@ -338,6 +341,23 @@ where
     }
 }
 
+/// Future returned as result of submitting a write request via `AioContext::write`.
+pub struct AioSyncResultFuture
+{
+    // common AIO future state
+    base: AioBaseFuture,
+}
+
+impl futures::Future for AioSyncResultFuture
+{
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+        self.base.poll()
+    }
+}
+
 // A future spawned as background task to retrieve I/O completion events from the kernel
 // and distributing the results to the current futures in flight.
 pub struct AioPollFuture {
@@ -483,6 +503,30 @@ pub struct AioContext {
     inner: std::sync::Arc<AioContextInner>,
 }
 
+/// Synchronization levels associated with I/O operations
+#[derive(Copy, Clone, Debug)]
+pub enum SyncLevel {
+    /// No synchronization requirement
+    None,
+
+    /// Data is written to device, but not necessarily meta data
+    Data,
+
+    /// Data and associated meta data is written to device
+    Full,
+}
+
+// Conversin of API syncrhnization value to kernel parameter flag value
+impl From<SyncLevel> for u32 {
+    fn from(level: SyncLevel) -> u32 {
+        match level {
+            SyncLevel::None => 0,
+            SyncLevel::Data => aio::RWF_DSYNC,
+            SyncLevel::Full => aio::RWF_SYNC,
+        }
+    }
+}
+
 impl AioContext {
     /// Create a new AioContext that is driven by the provided event loop.
     ///
@@ -543,6 +587,7 @@ impl AioContext {
                     offset,
                     len,
                     buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                    flags: 0,
                 },
                 state: None,
                 acquire_state: None,
@@ -569,6 +614,29 @@ impl AioContext {
     where
         ReadOnlyHandle: ops::Deref<Target = [u8]>,
     {
+        self.write_sync(fd, offset, buffer, SyncLevel::None)
+    }
+
+    /// Initiate an asynchronous write operation on the given file descriptor for writing
+    /// data to the provided absolute file offset from the buffer. The buffer also determines
+    /// the number of bytes to be written, which should be a multiple of the underlying device block
+    /// size.
+    ///
+    /// # Params:
+    /// - fd: The file descriptor of the file to which to write
+    /// - offset: The file offset where we want to write to
+    /// - buffer: A buffer holding the data to be written
+    /// - sync_level: A synchronization level to apply for this write operation
+    pub fn write_sync<ReadOnlyHandle>(
+        &self,
+        fd: RawFd,
+        offset: u64,
+        buffer: ReadOnlyHandle,
+        sync_level: SyncLevel
+    ) -> AioWriteResultFuture<ReadOnlyHandle>
+    where
+        ReadOnlyHandle: ops::Deref<Target = [u8]>,
+    {
         let len = buffer.len() as u64;
 
         // nothing really happens here until someone calls poll
@@ -581,11 +649,75 @@ impl AioContext {
                     offset,
                     len,
                     buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                    flags: sync_level as u32,
                 },
                 state: None,
                 acquire_state: None,
             },
             buffer: Some(buffer),
+        }
+    }
+
+    /// Initiate an asynchronous sync operation on the given file descriptor.
+    /// 
+    /// __Caveat:__ While this operation is defined in the ABI, this command is known to
+    /// fail with an invalid argument error (`EINVAL`) in many, if not all, cases. You are kind of
+    /// on your own.
+    ///
+    /// # Params:
+    /// - fd: The file descriptor of the file to which to write
+    pub fn sync(
+        &self,
+        fd: RawFd,
+    ) -> AioSyncResultFuture
+    {
+        // nothing really happens here until someone calls poll
+        AioSyncResultFuture {
+            base: AioBaseFuture {
+                context: self.inner.clone(),
+                iocb_info: IocbInfo {
+                    opcode: aio::IOCB_CMD_FSYNC,
+                    fd,
+                    buf: 0,
+                    len: 0,
+                    offset: 0,
+                    flags: 0,
+                },
+                state: None,
+                acquire_state: None,
+            },
+        }
+    }
+
+
+    /// Initiate an asynchronous data sync operation on the given file descriptor.
+    ///
+    /// __Caveat:__ While this operation is defined in the ABI, this command is known to
+    /// fail with an invalid argument error (`EINVAL`) in many, if not all, cases. You are kind of
+    /// on your own.
+    ///
+    /// # Params:
+    /// - fd: The file descriptor of the file to which to write
+    pub fn data_sync(
+        &self,
+        fd: RawFd,
+    ) -> AioSyncResultFuture
+    {
+        // nothing really happens here until someone calls poll
+        AioSyncResultFuture {
+            base: AioBaseFuture {
+                context: self.inner.clone(),
+                iocb_info: IocbInfo {
+                    opcode: aio::IOCB_CMD_FDSYNC,
+                    fd,
+                    buf: 0,
+                    len: 0,
+                    offset: 0,
+                    flags: 0,
+                },
+                state: None,
+                acquire_state: None,
+            },
         }
     }
 }
@@ -756,7 +888,6 @@ mod tests {
 
             let pool = futures_cpupool::CpuPool::new(5);
             let mut buffer = MemoryHandle::new();
-
             fill_pattern(65u8, &mut buffer);
 
             {
@@ -779,6 +910,84 @@ mod tests {
         file.read(&mut read_buffer).unwrap();
 
         assert!(validate_pattern(65u8, &read_buffer));
+    }
+
+    #[test]
+    fn write_block_sync_mt() {
+        // At this point, this test merely verifies that data ends up being written to
+        // a file in the presence of synchronization flags. What the test does not verify
+        // as that the specific synchronization guarantees are being fulfilled.
+        use io::{Read, Seek};
+
+        let file_name = temp_file_name();
+        create_temp_file(&file_name);
+
+        {
+            let owned_fd = OwnedFd::new_from_raw_fd(unsafe {
+                open(
+                    mem::transmute(file_name.as_os_str().as_bytes().as_ptr()),
+                    O_DIRECT | O_RDWR,
+                )
+            });
+            let fd = owned_fd.fd;
+
+            let pool = futures_cpupool::CpuPool::new(5);
+            let context = AioContext::new(&pool, 2).unwrap();
+
+            {
+                let mut buffer = MemoryHandle::new();
+                fill_pattern(65u8, &mut buffer);
+                let write_future = context.write(fd, 16384, buffer).map_err(|err| {
+                    panic!("{:?}", err);
+                });
+
+                let cpu_future = pool.spawn(write_future);
+                let result = cpu_future.wait();
+
+                assert!(result.is_ok());
+            }
+
+            {
+                let mut buffer = MemoryHandle::new();
+                fill_pattern(66u8, &mut buffer);
+                let write_future = context.write(fd, 32768, buffer).map_err(|err| {
+                    panic!("{:?}", err);
+                });
+
+                let cpu_future = pool.spawn(write_future);
+                let result = cpu_future.wait();
+
+                assert!(result.is_ok());
+            }
+
+            {
+                let mut buffer = MemoryHandle::new();
+                fill_pattern(67u8, &mut buffer);
+                let write_future = context.write(fd, 49152, buffer).map_err(|err| {
+                    panic!("{:?}", err);
+                });
+
+                let cpu_future = pool.spawn(write_future);
+                let result = cpu_future.wait();
+
+                assert!(result.is_ok());
+            }
+        }
+
+        let mut file = fs::File::open(&file_name).unwrap();
+        let mut read_buffer: [u8; 8192] = [0u8; 8192];
+
+        file.seek(io::SeekFrom::Start(16384)).unwrap();
+        file.read(&mut read_buffer).unwrap();
+        assert!(validate_pattern(65u8, &read_buffer));
+
+        file.seek(io::SeekFrom::Start(32768)).unwrap();
+        file.read(&mut read_buffer).unwrap();
+        assert!(validate_pattern(66u8, &read_buffer));
+
+        file.seek(io::SeekFrom::Start(49152)).unwrap();
+        file.read(&mut read_buffer).unwrap();
+        assert!(validate_pattern(67u8, &read_buffer));
     }
 
     #[test]
