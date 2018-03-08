@@ -507,24 +507,13 @@ pub struct AioContext {
 #[derive(Copy, Clone, Debug)]
 pub enum SyncLevel {
     /// No synchronization requirement
-    None,
+    None = 0,
 
     /// Data is written to device, but not necessarily meta data
-    Data,
+    Data = aio::RWF_DSYNC as isize,
 
     /// Data and associated meta data is written to device
-    Full,
-}
-
-// Conversin of API syncrhnization value to kernel parameter flag value
-impl From<SyncLevel> for u32 {
-    fn from(level: SyncLevel) -> u32 {
-        match level {
-            SyncLevel::None => 0,
-            SyncLevel::Data => aio::RWF_DSYNC,
-            SyncLevel::Full => aio::RWF_SYNC,
-        }
-    }
+    Full = aio::RWF_SYNC as isize,
 }
 
 impl AioContext {
