@@ -10,7 +10,9 @@ This package provides an integration of Linux kernel-level asynchronous I/O to t
 
 Linux kernel-level asynchronous I/O is different from the [Posix AIO library](http://man7.org/linux/man-pages/man7/aio.7.html). Posix AIO is implemented using a pool of userland threads, which invoke regular, blocking system calls to perform file I/O. [Linux kernel-level AIO](http://lse.sourceforge.net/io/aio.html), on the other hand, provides kernel-level asynchronous scheduling of I/O operations to the underlying block device.
 
-__Note__: Implementation and test development is still in progress.
+__Note__: Implementation and test development is still in progress. I'm waiting for tokio 0.2 to stabilize before doing a 
+next revision of this crate. In the interim, I'm working on vervolg, an implementation of a front-end for a subset of the 
+SQL language. Overall, my goal is to put together a test bed and experimentation platform for database kernels.
 
 ## Usage
 
