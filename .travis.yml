@@ -11,3 +11,8 @@ cache: cargo
 script:
   - cargo build --verbose --all
   - cargo test --verbose --all
+  
+after_success:
+    - cargo install cargo-kcov
+    - cargo kcov --print-install-kcov-sh | bash
+    - cargo kcov --coveralls -- --verify
