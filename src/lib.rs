@@ -67,6 +67,7 @@ extern crate mio;
 extern crate rand;
 extern crate tokio;
 
+use std::borrow;
 use std::error;
 use std::fmt;
 use std::io;
@@ -282,7 +283,7 @@ impl<Handle> error::Error for AioError<Handle> {
 /// Future returned as result of submitting a read request via `AioContext::read`.
 pub struct AioReadResultFuture<ReadWriteHandle>
 where
-    ReadWriteHandle: ops::DerefMut<Target = [u8]>,
+    ReadWriteHandle: borrow::BorrowMut<[u8]>,
 {
     // common AIO future state
     base: AioBaseFuture,
@@ -294,7 +295,7 @@ where
 
 impl<ReadWriteHandle> futures::Future for AioReadResultFuture<ReadWriteHandle>
 where
-    ReadWriteHandle: ops::DerefMut<Target = [u8]>,
+    ReadWriteHandle: borrow::BorrowMut<[u8]>,
 {
     type Item = ReadWriteHandle;
     type Error = AioError<ReadWriteHandle>;
@@ -313,7 +314,7 @@ where
 /// Future returned as result of submitting a write request via `AioContext::write`.
 pub struct AioWriteResultFuture<ReadOnlyHandle>
 where
-    ReadOnlyHandle: ops::Deref<Target = [u8]>,
+    ReadOnlyHandle: borrow::Borrow<[u8]>,
 {
     // common AIO future state
     base: AioBaseFuture,
@@ -325,7 +326,7 @@ where
 
 impl<ReadOnlyHandle> futures::Future for AioWriteResultFuture<ReadOnlyHandle>
 where
-    ReadOnlyHandle: ops::Deref<Target = [u8]>,
+    ReadOnlyHandle: borrow::Borrow<[u8]>,
 {
     type Item = ReadOnlyHandle;
     type Error = AioError<ReadOnlyHandle>;
@@ -560,12 +561,17 @@ impl AioContext {
         &self,
         fd: RawFd,
         offset: u64,
-        buffer: ReadWriteHandle,
+        mut buffer_obj: ReadWriteHandle,
     ) -> AioReadResultFuture<ReadWriteHandle>
     where
-        ReadWriteHandle: ops::DerefMut<Target = [u8]>,
+        ReadWriteHandle: borrow::BorrowMut<[u8]>,
     {
-        let len = buffer.len() as u64;
+        let (ptr, len) = {
+            let buffer = buffer_obj.borrow_mut();
+            let len = buffer.len() as u64;
+            let ptr = unsafe { mem::transmute(buffer.as_ptr()) };
+            (ptr, len)
+        };
 
         // nothing really happens here until someone calls poll
         AioReadResultFuture {
@@ -576,13 +582,13 @@ impl AioContext {
                     fd,
                     offset,
                     len,
-                    buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                    buf: ptr,
                     flags: 0,
                 },
                 state: None,
                 acquire_state: None,
             },
-            buffer: Some(buffer),
+            buffer: Some(buffer_obj),
         }
     }
 
@@ -602,7 +608,7 @@ impl AioContext {
         buffer: ReadOnlyHandle,
     ) -> AioWriteResultFuture<ReadOnlyHandle>
     where
-        ReadOnlyHandle: ops::Deref<Target = [u8]>,
+        ReadOnlyHandle: borrow::Borrow<[u8]>,
     {
         self.write_sync(fd, offset, buffer, SyncLevel::None)
     }
@@ -621,13 +627,18 @@ impl AioContext {
         &self,
         fd: RawFd,
         offset: u64,
-        buffer: ReadOnlyHandle,
+        buffer_obj: ReadOnlyHandle,
         sync_level: SyncLevel
     ) -> AioWriteResultFuture<ReadOnlyHandle>
     where
-        ReadOnlyHandle: ops::Deref<Target = [u8]>,
+        ReadOnlyHandle: borrow::Borrow<[u8]>,
     {
-        let len = buffer.len() as u64;
+        let (ptr, len) = {
+            let buffer = buffer_obj.borrow();
+            let len = buffer.len() as u64;
+            let ptr = unsafe { mem::transmute(buffer.as_ptr()) };
+            (ptr, len)
+        };
 
         // nothing really happens here until someone calls poll
         AioWriteResultFuture {
@@ -638,13 +649,13 @@ impl AioContext {
                     fd,
                     offset,
                     len,
-                    buf: unsafe { mem::transmute(buffer.as_ptr()) },
+                    buf: ptr,
                     flags: sync_level as u32,
                 },
                 state: None,
                 acquire_state: None,
             },
-            buffer: Some(buffer),
+            buffer: Some(buffer_obj),
         }
     }
 
@@ -720,6 +731,7 @@ impl AioContext {
 mod tests {
     use super::*;
 
+    use std::borrow::{Borrow, BorrowMut};
     use std::env;
     use std::fs;
     use std::io::Write;
@@ -808,16 +820,14 @@ mod tests {
         }
     }
 
-    impl ops::Deref for MemoryHandle {
-        type Target = [u8];
-
-        fn deref(&self) -> &Self::Target {
+    impl borrow::Borrow<[u8]> for MemoryHandle {
+        fn borrow(&self) -> &[u8] {
             unsafe { mem::transmute(&(*self.block.bytes.read().unwrap())[..]) }
         }
     }
 
-    impl ops::DerefMut for MemoryHandle {
-        fn deref_mut(&mut self) -> &mut Self::Target {
+    impl borrow::BorrowMut<[u8]> for MemoryHandle {
+        fn borrow_mut(&mut self) -> &mut [u8] {
             unsafe { mem::transmute(&mut (*self.block.bytes.write().unwrap())[..]) }
         }
     }
@@ -844,7 +854,7 @@ mod tests {
                 let read_future = context
                     .read(fd, 0, buffer)
                     .map(move |result_buffer| {
-                        assert!(validate_block(&result_buffer));
+                        assert!(validate_block(result_buffer.borrow()));
                     })
                     .map_err(|err| {
                         panic!("{:?}", err);
@@ -878,7 +888,7 @@ mod tests {
 
             let pool = futures_cpupool::CpuPool::new(5);
             let mut buffer = MemoryHandle::new();
-            fill_pattern(65u8, &mut buffer);
+            fill_pattern(65u8, buffer.borrow_mut());
 
             {
                 let context = AioContext::new(&pool, 2).unwrap();
@@ -926,7 +936,7 @@ mod tests {
 
             {
                 let mut buffer = MemoryHandle::new();
-                fill_pattern(65u8, &mut buffer);
+                fill_pattern(65u8, buffer.borrow_mut());
                 let write_future = context.write(fd, 16384, buffer).map_err(|err| {
                     panic!("{:?}", err);
                 });
@@ -939,7 +949,7 @@ mod tests {
 
             {
                 let mut buffer = MemoryHandle::new();
-                fill_pattern(66u8, &mut buffer);
+                fill_pattern(66u8, buffer.borrow_mut());
                 let write_future = context.write(fd, 32768, buffer).map_err(|err| {
                     panic!("{:?}", err);
                 });
@@ -952,7 +962,7 @@ mod tests {
 
             {
                 let mut buffer = MemoryHandle::new();
-                fill_pattern(67u8, &mut buffer);
+                fill_pattern(67u8, buffer.borrow_mut());
                 let write_future = context.write(fd, 49152, buffer).map_err(|err| {
                     panic!("{:?}", err);
                 });
@@ -1080,7 +1090,7 @@ mod tests {
                         let read_future = context
                             .read(fd, (index * 8192) % FILE_SIZE, buffer)
                             .map(move |result_buffer| {
-                                assert!(validate_block(&result_buffer));
+                                assert!(validate_block(result_buffer.borrow()));
                             })
                             .map_err(|err| {
                                 panic!("{:?}", err);
@@ -1136,26 +1146,26 @@ mod tests {
             context1
                 .read(fd, 8192, buffer1)
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.deref()));
-                    fill_pattern(0u8, &mut buffer);
+                    assert!(validate_block(buffer.borrow()));
+                    fill_pattern(0u8, buffer.borrow_mut());
                     buffer
                 })
                 .and_then(move |buffer| context2.write(fd, 8192, buffer))
                 .and_then(move |buffer| context3.read(fd, 0, buffer))
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(&buffer));
-                    fill_pattern(1u8, &mut buffer);
+                    assert!(validate_block(buffer.borrow()));
+                    fill_pattern(1u8, buffer.borrow_mut());
                     buffer
                 })
                 .and_then(move |buffer| context4.write(fd, 0, buffer))
                 .and_then(move |buffer| context5.read(fd, 8192, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(0u8, &buffer));
+                    assert!(validate_pattern(0u8, buffer.borrow()));
                     buffer
                 })
                 .and_then(move |buffer| context6.read(fd, 0, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(1u8, &buffer));
+                    assert!(validate_pattern(1u8, buffer.borrow()));
                     buffer
                 })
                 .map_err(|err| {
@@ -1178,26 +1188,26 @@ mod tests {
             context1
                 .read(fd, 16384, buffer2)
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.deref()));
-                    fill_pattern(2u8, &mut buffer);
+                    assert!(validate_block(buffer.borrow()));
+                    fill_pattern(2u8, buffer.borrow_mut());
                     buffer
                 })
                 .and_then(move |buffer| context2.write(fd, 16384, buffer))
                 .and_then(move |buffer| context3.read(fd, 24576, buffer))
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(&buffer));
-                    fill_pattern(3u8, &mut buffer);
+                    assert!(validate_block(buffer.borrow()));
+                    fill_pattern(3u8, buffer.borrow_mut());
                     buffer
                 })
                 .and_then(move |buffer| context4.write(fd, 24576, buffer))
                 .and_then(move |buffer| context5.read(fd, 16384, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(2u8, &buffer));
+                    assert!(validate_pattern(2u8, buffer.borrow()));
                     buffer
                 })
                 .and_then(move |buffer| context6.read(fd, 24576, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(3u8, &buffer));
+                    assert!(validate_pattern(3u8, buffer.borrow()));
                     buffer
                 })
                 .map_err(|err| {
@@ -1220,26 +1230,26 @@ mod tests {
             context1
                 .read(fd, 40960, buffer3)
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.deref()));
-                    fill_pattern(5u8, &mut buffer);
+                    assert!(validate_block(buffer.borrow()));
+                    fill_pattern(5u8, buffer.borrow_mut());
                     buffer
                 })
                 .and_then(move |buffer| context2.write(fd, 40960, buffer))
                 .and_then(move |buffer| context3.read(fd, 32768, buffer))
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(&buffer));
-                    fill_pattern(6u8, &mut buffer);
+                    assert!(validate_block(buffer.borrow()));
+                    fill_pattern(6u8, buffer.borrow_mut());
                     buffer
                 })
                 .and_then(move |buffer| context4.write(fd, 32768, buffer))
                 .and_then(move |buffer| context5.read(fd, 40960, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(5u8, &buffer));
+                    assert!(validate_pattern(5u8, buffer.borrow()));
                     buffer
                 })
                 .and_then(move |buffer| context6.read(fd, 32768, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(6u8, &buffer));
+                    assert!(validate_pattern(6u8, buffer.borrow()));
                     buffer
                 })
                 .map_err(|err| {
