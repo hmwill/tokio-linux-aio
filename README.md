@@ -44,7 +44,7 @@ Once you have added the crate to your project you should be able to write someth
             .read(fd, 0, buffer)
             .map(move |result_buffer| {
                 // do something upon successfully reading the data
-                assert!(validate_block(&result_buffer));
+                assert!(validate_block(result_buffer.as_ref()));
             })
             .map_err(|err| {
                 // do something else when things go wrong

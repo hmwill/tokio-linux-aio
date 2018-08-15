@@ -67,7 +67,7 @@ extern crate mio;
 extern crate rand;
 extern crate tokio;
 
-use std::borrow;
+use std::convert;
 use std::error;
 use std::fmt;
 use std::io;
@@ -283,7 +283,7 @@ impl<Handle> error::Error for AioError<Handle> {
 /// Future returned as result of submitting a read request via `AioContext::read`.
 pub struct AioReadResultFuture<ReadWriteHandle>
 where
-    ReadWriteHandle: borrow::BorrowMut<[u8]>,
+    ReadWriteHandle: convert::AsMut<[u8]>,
 {
     // common AIO future state
     base: AioBaseFuture,
@@ -295,7 +295,7 @@ where
 
 impl<ReadWriteHandle> futures::Future for AioReadResultFuture<ReadWriteHandle>
 where
-    ReadWriteHandle: borrow::BorrowMut<[u8]>,
+    ReadWriteHandle: convert::AsMut<[u8]>,
 {
     type Item = ReadWriteHandle;
     type Error = AioError<ReadWriteHandle>;
@@ -314,7 +314,7 @@ where
 /// Future returned as result of submitting a write request via `AioContext::write`.
 pub struct AioWriteResultFuture<ReadOnlyHandle>
 where
-    ReadOnlyHandle: borrow::Borrow<[u8]>,
+    ReadOnlyHandle: convert::AsRef<[u8]>,
 {
     // common AIO future state
     base: AioBaseFuture,
@@ -326,7 +326,7 @@ where
 
 impl<ReadOnlyHandle> futures::Future for AioWriteResultFuture<ReadOnlyHandle>
 where
-    ReadOnlyHandle: borrow::Borrow<[u8]>,
+    ReadOnlyHandle: convert::AsRef<[u8]>,
 {
     type Item = ReadOnlyHandle;
     type Error = AioError<ReadOnlyHandle>;
@@ -564,10 +564,10 @@ impl AioContext {
         mut buffer_obj: ReadWriteHandle,
     ) -> AioReadResultFuture<ReadWriteHandle>
     where
-        ReadWriteHandle: borrow::BorrowMut<[u8]>,
+        ReadWriteHandle: convert::AsMut<[u8]>,
     {
         let (ptr, len) = {
-            let buffer = buffer_obj.borrow_mut();
+            let buffer = buffer_obj.as_mut();
             let len = buffer.len() as u64;
             let ptr = unsafe { mem::transmute(buffer.as_ptr()) };
             (ptr, len)
@@ -608,7 +608,7 @@ impl AioContext {
         buffer: ReadOnlyHandle,
     ) -> AioWriteResultFuture<ReadOnlyHandle>
     where
-        ReadOnlyHandle: borrow::Borrow<[u8]>,
+        ReadOnlyHandle: convert::AsRef<[u8]>,
     {
         self.write_sync(fd, offset, buffer, SyncLevel::None)
     }
@@ -631,10 +631,10 @@ impl AioContext {
         sync_level: SyncLevel
     ) -> AioWriteResultFuture<ReadOnlyHandle>
     where
-        ReadOnlyHandle: borrow::Borrow<[u8]>,
+        ReadOnlyHandle: convert::AsRef<[u8]>,
     {
         let (ptr, len) = {
-            let buffer = buffer_obj.borrow();
+            let buffer = buffer_obj.as_ref();
             let len = buffer.len() as u64;
             let ptr = unsafe { mem::transmute(buffer.as_ptr()) };
             (ptr, len)
@@ -820,14 +820,14 @@ mod tests {
         }
     }
 
-    impl borrow::Borrow<[u8]> for MemoryHandle {
-        fn borrow(&self) -> &[u8] {
+    impl convert::AsRef<[u8]> for MemoryHandle {
+        fn as_ref(&self) -> &[u8] {
             unsafe { mem::transmute(&(*self.block.bytes.read().unwrap())[..]) }
         }
     }
 
-    impl borrow::BorrowMut<[u8]> for MemoryHandle {
-        fn borrow_mut(&mut self) -> &mut [u8] {
+    impl convert::AsMut<[u8]> for MemoryHandle {
+        fn as_mut(&mut self) -> &mut [u8] {
             unsafe { mem::transmute(&mut (*self.block.bytes.write().unwrap())[..]) }
         }
     }
@@ -854,7 +854,7 @@ mod tests {
                 let read_future = context
                     .read(fd, 0, buffer)
                     .map(move |result_buffer| {
-                        assert!(validate_block(result_buffer.borrow()));
+                        assert!(validate_block(result_buffer.as_ref()));
                     })
                     .map_err(|err| {
                         panic!("{:?}", err);
@@ -888,7 +888,7 @@ mod tests {
 
             let pool = futures_cpupool::CpuPool::new(5);
             let mut buffer = MemoryHandle::new();
-            fill_pattern(65u8, buffer.borrow_mut());
+            fill_pattern(65u8, buffer.as_mut());
 
             {
                 let context = AioContext::new(&pool, 2).unwrap();
@@ -936,7 +936,7 @@ mod tests {
 
             {
                 let mut buffer = MemoryHandle::new();
-                fill_pattern(65u8, buffer.borrow_mut());
+                fill_pattern(65u8, buffer.as_mut());
                 let write_future = context.write(fd, 16384, buffer).map_err(|err| {
                     panic!("{:?}", err);
                 });
@@ -949,7 +949,7 @@ mod tests {
 
             {
                 let mut buffer = MemoryHandle::new();
-                fill_pattern(66u8, buffer.borrow_mut());
+                fill_pattern(66u8, buffer.as_mut());
                 let write_future = context.write(fd, 32768, buffer).map_err(|err| {
                     panic!("{:?}", err);
                 });
@@ -962,7 +962,7 @@ mod tests {
 
             {
                 let mut buffer = MemoryHandle::new();
-                fill_pattern(67u8, buffer.borrow_mut());
+                fill_pattern(67u8, buffer.as_mut());
                 let write_future = context.write(fd, 49152, buffer).map_err(|err| {
                     panic!("{:?}", err);
                 });
@@ -1090,7 +1090,7 @@ mod tests {
                         let read_future = context
                             .read(fd, (index * 8192) % FILE_SIZE, buffer)
                             .map(move |result_buffer| {
-                                assert!(validate_block(result_buffer.borrow()));
+                                assert!(validate_block(result_buffer.as_ref()));
                             })
                             .map_err(|err| {
                                 panic!("{:?}", err);
@@ -1146,26 +1146,26 @@ mod tests {
             context1
                 .read(fd, 8192, buffer1)
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.borrow()));
-                    fill_pattern(0u8, buffer.borrow_mut());
+                    assert!(validate_block(buffer.as_ref()));
+                    fill_pattern(0u8, buffer.as_mut());
                     buffer
                 })
                 .and_then(move |buffer| context2.write(fd, 8192, buffer))
                 .and_then(move |buffer| context3.read(fd, 0, buffer))
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.borrow()));
-                    fill_pattern(1u8, buffer.borrow_mut());
+                    assert!(validate_block(buffer.as_ref()));
+                    fill_pattern(1u8, buffer.as_mut());
                     buffer
                 })
                 .and_then(move |buffer| context4.write(fd, 0, buffer))
                 .and_then(move |buffer| context5.read(fd, 8192, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(0u8, buffer.borrow()));
+                    assert!(validate_pattern(0u8, buffer.as_ref()));
                     buffer
                 })
                 .and_then(move |buffer| context6.read(fd, 0, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(1u8, buffer.borrow()));
+                    assert!(validate_pattern(1u8, buffer.as_ref()));
                     buffer
                 })
                 .map_err(|err| {
@@ -1188,26 +1188,26 @@ mod tests {
             context1
                 .read(fd, 16384, buffer2)
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.borrow()));
-                    fill_pattern(2u8, buffer.borrow_mut());
+                    assert!(validate_block(buffer.as_ref()));
+                    fill_pattern(2u8, buffer.as_mut());
                     buffer
                 })
                 .and_then(move |buffer| context2.write(fd, 16384, buffer))
                 .and_then(move |buffer| context3.read(fd, 24576, buffer))
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.borrow()));
-                    fill_pattern(3u8, buffer.borrow_mut());
+                    assert!(validate_block(buffer.as_ref()));
+                    fill_pattern(3u8, buffer.as_mut());
                     buffer
                 })
                 .and_then(move |buffer| context4.write(fd, 24576, buffer))
                 .and_then(move |buffer| context5.read(fd, 16384, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(2u8, buffer.borrow()));
+                    assert!(validate_pattern(2u8, buffer.as_ref()));
                     buffer
                 })
                 .and_then(move |buffer| context6.read(fd, 24576, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(3u8, buffer.borrow()));
+                    assert!(validate_pattern(3u8, buffer.as_ref()));
                     buffer
                 })
                 .map_err(|err| {
@@ -1230,26 +1230,26 @@ mod tests {
             context1
                 .read(fd, 40960, buffer3)
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.borrow()));
-                    fill_pattern(5u8, buffer.borrow_mut());
+                    assert!(validate_block(buffer.as_ref()));
+                    fill_pattern(5u8, buffer.as_mut());
                     buffer
                 })
                 .and_then(move |buffer| context2.write(fd, 40960, buffer))
                 .and_then(move |buffer| context3.read(fd, 32768, buffer))
                 .map(|mut buffer| -> MemoryHandle {
-                    assert!(validate_block(buffer.borrow()));
-                    fill_pattern(6u8, buffer.borrow_mut());
+                    assert!(validate_block(buffer.as_ref()));
+                    fill_pattern(6u8, buffer.as_mut());
                     buffer
                 })
                 .and_then(move |buffer| context4.write(fd, 32768, buffer))
                 .and_then(move |buffer| context5.read(fd, 40960, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(5u8, buffer.borrow()));
+                    assert!(validate_pattern(5u8, buffer.as_ref()));
                     buffer
                 })
                 .and_then(move |buffer| context6.read(fd, 32768, buffer))
                 .map(|buffer| -> MemoryHandle {
-                    assert!(validate_pattern(6u8, buffer.borrow()));
+                    assert!(validate_pattern(6u8, buffer.as_ref()));
                     buffer
                 })
                 .map_err(|err| {
