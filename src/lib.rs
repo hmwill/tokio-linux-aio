@@ -113,6 +113,7 @@ struct IocbInfo {
 }
 
 // State information that is associated with an I/O request that is currently in flight.
+#[derive(Debug)]
 struct RequestState {
     // Linux kernal I/O control block which can be submitted to io_submit
     request: aio::iocb,
@@ -423,6 +424,7 @@ impl futures::Future for AioPollFuture {
 }
 
 // Shared state within AioContext that is backing I/O requests as represented by the individual futures.
+#[derive(Debug)]
 struct Capacity {
     // pre-allocated eventfds and iocbs that are associated with scheduled I/O requests
     state: Vec<Box<RequestState>>,
@@ -450,6 +452,7 @@ impl Capacity {
 
 // The inner state, which is shared between the AioContext object returned to clients and
 // used internally by futures in flight.
+#[derive(Debug)]
 struct AioContextInner {
     // the context handle for submitting AIO requests to the kernel
     context: aio::aio_context_t,
@@ -500,7 +503,7 @@ impl Drop for AioContextInner {
 
 /// AioContext provides a submission queue for asycnronous I/O operations to
 /// block devices within the Linux kernel.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AioContext {
     inner: std::sync::Arc<AioContextInner>,
 }

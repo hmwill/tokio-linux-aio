@@ -33,11 +33,13 @@ use futures;
 // and then exposing it by itself.
 // -----------------------------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct SemaphoreInner {
     capacity: usize,
     waiters: collections::VecDeque<futures::task::Task>,
 }
 
+#[derive(Debug)]
 pub struct Semaphore {
     inner: sync::RwLock<SemaphoreInner>,
 }
