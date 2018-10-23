@@ -29,35 +29,37 @@ Next, add this to the root module of your crate:
 
 Once you have added the crate to your project you should be able to write something like this:
 
-    // Let's use a standard thread pool
-    let pool = futures_cpupool::CpuPool::new(5);
+```rust
+// Let's use a standard thread pool
+let pool = futures_cpupool::CpuPool::new(5);
 
-    // These are handle objects for memory regions
-    let buffer = MemoryHandle::new();
+// These are handle objects for memory regions
+let buffer = MemoryHandle::new();
 
-    {
-        // Here we go: create an execution context, which uses the pool for background work
-        let context = AioContext::new(&pool, 10).unwrap();
+{
+    // Here we go: create an execution context, which uses the pool for background work
+    let context = AioContext::new(&pool, 10).unwrap();
 
-        // Create a future to read from a given file (fd) at the given offset into our buffer
-        let read_future = context
-            .read(fd, 0, buffer)
-            .map(move |result_buffer| {
-                // do something upon successfully reading the data
-                assert!(validate_block(result_buffer.as_ref()));
-            })
-            .map_err(|err| {
-                // do something else when things go wrong
-                panic!("{:?}", err);
-            });
+    // Create a future to read from a given file (fd) at the given offset into our buffer
+    let read_future = context
+        .read(fd, 0, buffer)
+        .map(move |result_buffer| {
+            // do something upon successfully reading the data
+            assert!(validate_block(result_buffer.as_ref()));
+        })
+        .map_err(|err| {
+            // do something else when things go wrong
+            panic!("{:?}", err);
+        });
 
-        // Execute the future and wait for its completion
-        let cpu_future = pool.spawn(read_future);
-        let result = cpu_future.wait();
+    // Execute the future and wait for its completion
+    let cpu_future = pool.spawn(read_future);
+    let result = cpu_future.wait();
 
-        // Should be OK
-        assert!(result.is_ok());
-    }
+    // Should be OK
+    assert!(result.is_ok());
+}
+```
 
 ## License
 
