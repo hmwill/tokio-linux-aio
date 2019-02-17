@@ -4,16 +4,24 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Tell cargo to tell rustc to link the system bzip2
-    // shared library.
-    println!("cargo:rustc-link-lib=bz2");
+    let target = env::var("TARGET").expect("Cargo build scripts always have TARGET");
 
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
     // the resulting bindings.
-    let bindings = bindgen::Builder::default()
+    let mut bindings = bindgen::Builder::default()
         .trust_clang_mangling(false)
-         // The input header we would like to generate
+        .clang_arg("-target")
+        .clang_arg(target);
+
+    if let Ok(sysroot) = env::var("SYSROOT") {
+        bindings = bindings
+            .clang_arg("--sysroot")
+            .clang_arg(sysroot);
+    }
+
+    let bindings = bindings
+        // The input header we would like to generate
         // bindings for.
         .header("wrapper.h")
         // Finish the builder and generate the bindings.
