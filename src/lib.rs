@@ -119,10 +119,10 @@ struct RequestState {
     request: aio::iocb,
 
     // Concurrency primitive to notify completion to the associated future
-    completed_receiver: futures::sync::oneshot::Receiver<c_long>,
+    completed_receiver: futures::sync::oneshot::Receiver<aio_bindings::__s64>,
 
     // We have both sides of a oneshot channel here
-    completed_sender: Option<futures::sync::oneshot::Sender<c_long>>,
+    completed_sender: Option<futures::sync::oneshot::Sender<aio_bindings::__s64>>,
 }
 
 // Common data structures for futures returned by `AioContext`.
@@ -170,7 +170,7 @@ impl AioBaseFuture {
             let state_addr = state.deref().deref() as *const RequestState;
 
             // Fill in the iocb data structure to be submitted to the kernel
-            state.request.aio_data = unsafe { mem::transmute(state_addr) };
+            state.request.aio_data = unsafe { mem::transmute::<_, usize>(state_addr) } as u64;
             state.request.aio_resfd = self.context.completed_fd as u32;
             state.request.aio_flags = aio::IOCB_FLAG_RESFD | self.iocb_info.flags;
             state.request.aio_fildes = self.iocb_info.fd as u32;
@@ -411,7 +411,7 @@ impl futures::Future for AioPollFuture {
 
             // dispatch the retrieved events to the associated futures
             for ref event in &self.events {
-                let request_state: &mut RequestState = unsafe { mem::transmute(event.data) };
+                let request_state: &mut RequestState = unsafe { mem::transmute(event.data as usize) } ;
                 request_state
                     .completed_sender
                     .take()
@@ -572,7 +572,7 @@ impl AioContext {
         let (ptr, len) = {
             let buffer = buffer_obj.as_mut();
             let len = buffer.len() as u64;
-            let ptr = unsafe { mem::transmute(buffer.as_ptr()) };
+            let ptr = unsafe { mem::transmute::<_, usize>(buffer.as_ptr()) } as u64;
             (ptr, len)
         };
 
@@ -639,7 +639,7 @@ impl AioContext {
         let (ptr, len) = {
             let buffer = buffer_obj.as_ref();
             let len = buffer.len() as u64;
-            let ptr = unsafe { mem::transmute(buffer.as_ptr()) };
+            let ptr = unsafe { mem::transmute::<_, usize>(buffer.as_ptr()) } as c_long;
             (ptr, len)
         };
 
@@ -652,7 +652,7 @@ impl AioContext {
                     fd,
                     offset,
                     len,
-                    buf: ptr,
+                    buf: ptr as u64,
                     flags: sync_level as u32,
                 },
                 state: None,
