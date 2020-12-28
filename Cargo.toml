@@ -15,7 +15,7 @@ travis-ci = { repository = "hmwill/tokio-linux-aio" }
 
 [dependencies]
 rand = "0.6"
-tokio = "0.1"
+tokio = "1.0"
 futures = "0.1"
 futures-cpupool = "0.1"
 mio = "0.6.13"
