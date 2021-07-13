@@ -41,13 +41,13 @@ struct SemaphoreInner {
 
 #[derive(Debug)]
 pub struct Semaphore {
-    inner: sync::RwLock<SemaphoreInner>,
+    inner: parking_lot::RwLock<SemaphoreInner>,
 }
 
 impl Semaphore {
     pub fn new(initial: usize) -> Semaphore {
         Semaphore {
-            inner: sync::RwLock::new(SemaphoreInner {
+            inner: parking_lot::RwLock::new(SemaphoreInner {
                 capacity: initial,
                 waiters: collections::VecDeque::new(),
             }),
@@ -55,45 +55,28 @@ impl Semaphore {
     }
 
     pub fn acquire(&self) -> SemaphoreHandle {
-        let mut lock_result = self.inner.write();
-
-        match lock_result {
-            Ok(ref mut guard) => {
-                if guard.capacity > 0 {
-                    guard.capacity -= 1;
-                    SemaphoreHandle::Completed(futures::future::result(Ok(())))
-                } else {
-                    guard.waiters.push_back(futures::task::current());
-                    SemaphoreHandle::Waiting
-                }
-            }
-            Err(err) => panic!("Lock failure {:?}", err),
+        let mut guard = self.inner.write();
+        if guard.capacity > 0 {
+            guard.capacity -= 1;
+            SemaphoreHandle::Completed(futures::future::result(Ok(())))
+        } else {
+            guard.waiters.push_back(futures::task::current());
+            SemaphoreHandle::Waiting
         }
     }
 
     pub fn release(&self) {
-        let mut lock_result = self.inner.write();
-
-        match lock_result {
-            Ok(ref mut guard) => {
-                if !guard.waiters.is_empty() {
-                    guard.waiters.pop_front().unwrap().notify();
-                } else {
-                    guard.capacity += 1;
-                }
-            }
-            Err(err) => panic!("Lock failure {:?}", err),
+        let mut guard = self.inner.write();
+        if !guard.waiters.is_empty() {
+            guard.waiters.pop_front().unwrap().notify();
+        } else {
+            guard.capacity += 1;
         }
     }
 
     // For testing code
     pub fn current_capacity(&self) -> usize {
-        let mut lock_result = self.inner.read();
-
-        match lock_result {
-            Ok(ref mut guard) => guard.capacity,
-            Err(_) => panic!("Lock failure"),
-        }
+        self.inner.read().capacity
     }
 }
 
